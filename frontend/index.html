@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A道工作台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside class="side">
+  <div class="brand"><span class="seal">A</span><div><b>A道工作台</b><small>AI 作业批改与学情分析</small></div></div>
+  <nav>
+    <button data-view="work" class="on">批改</button>
+    <button data-view="jobs">批改队列 <span id="queueCount" class="nav-count">0</span></button>
+    <button data-view="tasks">任务中心</button>
+    <button data-view="classes">班级管理</button>
+    <button data-view="reports">学情报告</button>
+    <button data-view="papers">试卷库</button>
+    <button data-view="settings">模型设置</button>
+  </nav>
+  <div class="side-foot" id="modelBadge"></div>
+</aside>
+
+<main>
+  <!-- 批改 -->
+  <section id="view-work" class="view on">
+    <div id="home">
+      <h1>今天批改哪一份？</h1>
+      <p class="lead">上传学生作答后的试卷，识别题目与答案、判分，再把对错号画回卷面。OCR 模式直接使用答案文字块坐标标注。</p>
+      <label id="drop" class="drop">
+        <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden>
+        <div class="drop-icon">＋</div>
+        <div><b>点击选择或把文件拖到这里</b><br><span>PDF · PNG · JPG · WebP；同一次批改可添加试卷、标准答案和一名学生的多页作答。最多 20 个文件，单个 40MB，合计 200MB。</span></div>
+      </label>
+      <div id="uploadDrafts" class="upload-drafts" aria-label="切换待开始草稿" hidden></div>
+      <div id="materialList" class="material-list" aria-label="待开始的批改材料"></div>
+      <div class="upload-start"><span id="materialSummary" class="sub" role="status"></span><button type="button" class="primary" id="startUpload" disabled>开始批改</button></div>
+      <div class="pick">
+        <label>识别方式<select id="uOcr"><option value="deepseek_ocr">DeepSeek OCR（默认）</option></select></label>
+        <label>班级<select id="uClass"></select></label>
+        <label>任务<select id="uTask"></select></label>
+        <label>学生<select id="uStudent"></select></label>
+      </div>
+      <details class="keybox">
+        <summary>我有标准答案（可选）</summary>
+        <textarea id="answerKey" rows="4" placeholder="例如：1. 20   2. 9   3. 42 …&#10;留空则由 AI 解题；同一套试卷只在第一次生成答案，之后直接复用。"></textarea>
+        <p class="sub"><label class="link">添加标准答案文件（PDF / 图片）<input type="file" id="keyFile" accept=".pdf,.png,.jpg,.jpeg,.webp" hidden></label>
+          <span id="keyMsg">　加入列表后，点击「开始批改」统一处理</span></p>
+      </details>
+      <p id="uploadErr" class="err"></p>
+      <div id="queue" class="list"></div>
+      <div id="activeJobsSection" hidden><h2>正在批改</h2><div id="activeJobs" class="list"></div></div>
+      <h2>最近批改</h2>
+      <div id="history" class="list"></div>
+    </div>
+
+    <div id="desk" hidden>
+      <header class="desk-head">
+        <button class="ghost" id="back">← 返回</button>
+        <div class="desk-title"><h1 id="dTitle"></h1><div id="dBadges" class="badges"></div></div>
+        <label class="inline no-print" id="dStudentWrap" hidden>归档到 <select id="dStudent"></select></label>
+        <a class="ghost no-print" id="pdfBtn" hidden>下载 PDF</a>
+        <button class="ghost no-print" id="retryJob" hidden>重试批改</button>
+        <button class="ghost no-print" id="regrade" hidden>重新批改</button>
+      </header>
+      <p class="sub job-notice" id="jobNotice" role="status"></p>
+      <div class="desk-body">
+        <div class="paper">
+          <div class="paper-bar">
+            <div id="pageTabs" class="tabs"></div>
+            <div class="seg"><button id="showAnn" class="on">批改后</button><button id="showRaw">原图</button></div>
+          </div>
+          <button id="retryPage" class="ghost" hidden>重新加载页面</button>
+          <div class="paper-img"><img id="pageImg" alt="试卷页面"><div id="paperWait" class="wait">正在处理…</div></div>
+        </div>
+        <div class="panel">
+          <ol id="steps" class="steps"></ol>
+          <details id="jobMetrics" class="job-metrics" hidden></details>
+          <div id="summary" class="summary" hidden></div>
+          <div id="qlist" class="qlist"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-jobs" class="view">
+    <h1>批改队列</h1><p class="lead">离开页面后，服务端会继续批改。点击任务可恢复进度、查看日志和原图。</p>
+    <div class="bar"><label class="inline">状态<select id="jobFilter"><option value="all">全部</option><option value="queued">排队中</option><option value="running">批改中</option><option value="done">已完成</option><option value="failed">失败</option><option value="interrupted">已中断</option></select></label></div>
+    <div id="jobList" class="list wide"></div>
+  </section>
+  <!-- 任务中心 -->
+  <section id="view-tasks" class="view">
+    <div id="taskHome">
+      <h1>任务中心</h1>
+      <p class="lead">一次作业或测验就是一个任务。每位学生的试卷和多页作答可一起添加，确认材料后开始批改。这里能看到谁交了、谁没交、哪些题还要人工确认。</p>
+      <form id="taskForm" class="bar">
+        <select id="tClass" required></select>
+        <input id="tTitle" placeholder="任务名称，例如：第三单元测验" required maxlength="60">
+        <button class="primary">新建任务</button>
+      </form>
+      <div id="taskList" class="list wide"></div>
+    </div>
+    <div id="taskDetail" hidden></div>
+  </section>
+
+  <!-- 班级管理 -->
+  <section id="view-classes" class="view">
+    <div id="classHome">
+      <h1>班级管理</h1>
+      <p class="lead">建好班级和花名册后，批改结果会按卷面上的姓名自动归到学生档案，成长档案和学情报告都由这些批改数据生成。</p>
+      <div class="papers-wrap">
+        <div>
+          <form id="classForm" class="bar"><input id="cName" placeholder="新班级名称，例如：三年级 2 班" required maxlength="40"><button class="primary">添加</button></form>
+          <div id="classList" class="list"></div>
+        </div>
+        <div id="classDetail" class="paper-detail" hidden></div>
+      </div>
+    </div>
+    <div id="studentPage" hidden></div>
+  </section>
+
+  <!-- 学情报告 -->
+  <section id="view-reports" class="view">
+    <h1>学情报告</h1>
+    <p class="lead">按班级或单次任务汇总：共性错题、知识点掌握、学生分层和需要关注的学生。数据全部来自已批改的试卷。</p>
+    <div class="bar no-print">
+      <select id="rClass"></select><select id="rTask"></select>
+      <a class="ghost" id="rCsv" hidden>导出成绩 CSV</a><button class="ghost" id="rPrint" hidden>打印 / 存为 PDF</button>
+    </div>
+    <div id="reportBody"></div>
+  </section>
+
+  <!-- 试卷库 -->
+  <section id="view-papers" class="view">
+    <h1>试卷库</h1>
+    <p class="lead">每套试卷第一次批改时，题目和标准答案会保存在这里。之后再遇到同一套试卷，直接复用答案，不再重新解题。</p>
+    <div class="papers-wrap">
+      <div id="paperList" class="list"></div>
+      <div id="paperDetail" class="paper-detail" hidden></div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="view-settings" class="view">
+    <h1>模型设置</h1>
+    <p class="lead">通过 Claude Agent SDK 调用任意 Anthropic 兼容接口。默认配置为 DeepSeek V4.1 Flash。</p>
+    <form id="setForm" class="card form">
+      <label>模型名称<input id="sModel" placeholder="deepseek-flash" required>
+        <small>DeepSeek V4.1 Flash 的模型 ID 是 <code>deepseek-flash</code>，必须是支持图片输入的模型。</small></label>
+      <label>接口地址（Base URL）<input id="sUrl" placeholder="https://api.deepseek.com/anthropic" required>
+        <small>填 Anthropic 兼容地址，结尾不要带 <code>/v1</code>。</small></label>
+      <label>API Key<input id="sKey" type="password" autocomplete="off" placeholder="sk-…">
+        <small id="keyHint">保存在服务端数据卷中，页面上不会回显。</small></label>
+      <label class="check"><input type="checkbox" id="sZoom"> 允许复核 Agent 自主调用"放大查看"工具
+        <small>仅视觉识别模式生效；接口不支持工具返回图片时会自动降级为普通复核。</small></label>
+      <label class="check"><input type="checkbox" id="sOcr"> 使用 DeepSeek OCR 辅助定位与交叉核对
+        <small id="ocrHint"></small></label>
+      <div class="row"><button class="primary" type="submit">保存</button>
+        <button class="ghost" type="button" id="testBtn">测试连接</button><span id="setMsg"></span></div>
+    </form>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

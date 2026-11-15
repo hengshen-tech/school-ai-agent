@@ -1,0 +1,30 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Student work, saved model settings and generated grading results
+data/
+backend/data/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local tools and generated artifacts
+.DS_Store
+.idea/
+.vscode/
+.codex/
+.agents/
+*.log
+school-ai-agent-upload.zip

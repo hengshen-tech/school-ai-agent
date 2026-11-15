@@ -1,0 +1,23 @@
+services:
+  grader:
+    build: .
+    image: grader-workbench:latest
+    container_name: grader-workbench
+    ports:
+      - "${PORT:-8001}:8001"
+    volumes:
+      - grader-data:/data          # 试卷库、批改记录、模型设置都在这里
+    environment:
+      # 以下都可以留空，启动后在页面「模型设置」里填写
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/anthropic}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      PAPER_MATCH_THRESHOLD: ${PAPER_MATCH_THRESHOLD:-0.85}
+      MAX_PARALLEL_JOBS: ${MAX_PARALLEL_JOBS:-2}     # 同时批改的份数
+      MAX_PARALLEL_MODEL_CALLS: ${MAX_PARALLEL_MODEL_CALLS:-3} # 所有批改共享的模型调用并发上限
+      AGENT_TIMEOUT_S: ${AGENT_TIMEOUT_S:-1800}      # 单次 Agent 调用最多等待 30 分钟
+      APP_PASSWORD: ${APP_PASSWORD:-}                # 设置后访问页面需要输入口令（用户名随意）
+    restart: unless-stopped
+
+volumes:
+  grader-data:
