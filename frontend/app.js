@@ -663,12 +663,17 @@ function drawResult() {
     if (q.position_source === "vision_fallback") notes.push(`<p class="q-note plain">位置由模型看图推断，可用「框选答案位置」修正。</p>`);
     if (q.position_note && !q.draw) notes.push(`<p class="q-note">${esc(q.position_note)}</p>`);
     const btn = (st, t) => `<button title="${LABEL[st]}" class="${q.status === st ? "on" : ""}" data-q="${esc(q.id)}" data-s="${st}">${t}</button>`;
+    const metadata = [];
+    if (cur.page_count > 1) metadata.push(`<span title="${esc(questionPageLabel(q))}">第 ${esc(q.page)} 页</span>`);
+    if (q.knowledge) metadata.push(`<span>${esc(q.knowledge)}</span>`);
+    if (q.ocr_confirmed) metadata.push(`<span>OCR 印证</span>`);
     return `<div class="q ${q.status}">
       <div class="q-top"><span class="q-id">${esc(questionLabel(q))}</span>
         <span class="q-ans">学生：<b>${ans}</b> <s>· 标准答案：${esc(q.standard_answer ?? "缺失")}</s></span>
         <span class="chip ${q.status}">${LABEL[q.status]}${q.overridden ? " · 人工" : ""}</span></div>
       <p class="q-stem">${esc(q.question)}</p>${notes.join("")}
-      <div class="q-act">人工改判 ${btn("correct", "✓")}${btn("partial", "½")}${btn("wrong", "✗")}${!q.bbox_ok || !q.bbox_px || ["vision", "vision_fallback"].includes(q.position_source) || (!q.draw && q.status !== "review") ? `<button data-position="${esc(q.id)}">框选答案位置</button>` : ""}<span>${esc(questionPageLabel(q))}${q.knowledge ? " · " + esc(q.knowledge) : ""}${q.ocr_confirmed ? " · OCR 印证" : ""}</span></div>
+      <div class="q-act"><div class="q-verdict"><span>人工改判</span>${btn("correct", "✓")}${btn("partial", "½")}${btn("wrong", "✗")}</div>${!q.bbox_ok || !q.bbox_px || ["vision", "vision_fallback"].includes(q.position_source) || (!q.draw && q.status !== "review") ? `<button class="q-position" data-position="${esc(q.id)}">框选答案位置</button>` : ""}</div>
+      ${metadata.length ? `<div class="q-meta">${metadata.join('<span aria-hidden="true">·</span>')}</div>` : ""}
     </div>`;
   }).join("");
   $$("#qlist button[data-position]").forEach((b) => (b.onclick = () => beginManualPosition(b.dataset.position)));

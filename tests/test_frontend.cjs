@@ -480,11 +480,13 @@ test('rapid manual reviews wait for prior updates and retain both decisions',asy
   assert.equal(s.run('cur.questions[1].status'),'wrong');
   assert.equal(s.run('page'),4);
 });
-test('marked-but-undrawn answers can be repositioned and show their source file',()=>{
+test('marked-but-undrawn answers keep positioning with compact page metadata',()=>{
   const s=setup();reviewFixture(s);
   s.run('cur.questions[0].status="correct";cur.questions[0].position_note="答案旁没有可用的标注空间";drawResult()');
   assert.match(s.el('#qlist').innerHTML,/data-position="1"/);
-  assert.match(s.el('#qlist').innerHTML,/work-a.png/);
+  assert.match(s.el('#qlist').innerHTML,/<div class="q-verdict"><span>人工改判<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/class="q-position" data-position="1">框选答案位置<\/button>/);
+  assert.match(s.el('#qlist').innerHTML,/<div class="q-meta"><span title="work-a.png 第 1 页">第 3 页<\/span>/);
 });
 
 test('hierarchical question labels display without changing manual review IDs',()=>{
