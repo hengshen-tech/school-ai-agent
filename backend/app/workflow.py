@@ -9,9 +9,10 @@ from pathlib import Path
 from fractions import Fraction
 
 from PIL import Image
-from . import imaging, materials, ocr, store
-from .agents import AgentError, run_workflow_agent
-from .positioning import ANNOTATION_VERSION
+from . import materials, ocr, store
+from .agents import AgentError
+from .positioning import ANNOTATION_VERSION, pending_positions, apply_visual_fallback
+from .submission_agent import run_single_agent
 
 
 def _clone(value):
@@ -46,6 +47,7 @@ class WorkflowState:
     def __init__(self, sid, cfg, meta, pages, manifest, emit, teacher_key=''):
         self.sid, self.cfg, self.meta = sid, cfg, meta
         self.current_stage = 'parse'
+        self.running_stages = set()
         self.pages, self.manifest, self.emit = list(pages), _clone(manifest), emit
         self.teacher_key = teacher_key
         self.mode = meta.get('mode', 'grade')
@@ -55,23 +57,36 @@ class WorkflowState:
         self.source = self.review = self.grades = None
         self.answers, self.ocr_pages = [], {}
         self.positions_submitted = False
+        self.score_totals = {}
         self.paper_cache_hit = False
         self.published = False
         self.reviews_count = 0
-        self.reads = {}
         self.paper = store.get_paper(meta['paper_id']) if meta.get('paper_id') else None
         if meta.get('paper_id') and not self.paper:
             raise ValueError('所选试卷不存在')
         self.references = (self.paper or {}).get('reference_pages', [])
         self.page_hashes = [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in pages]
         self.context_hash = hashlib.sha256(json.dumps({'manifest': manifest, 'teacher': teacher_key,
-            'mode': self.mode, 'paper': meta.get('paper_id'), 'reference_revision_bound': True, 'ocr_stage': 'input-v1',
+            'mode': self.mode, 'paper': meta.get('paper_id'), 'reference_revision_bound': True, 'input_mode': 'images-only',
+            'execution_mode': meta.get('execution_mode', 'native_agents'),
             'config': {k: v for k, v in cfg.items() if k != 'api_key' and not k.startswith('_')},
             'files': self.page_hashes},
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     def persist(self, name, data):
         store.save_artifact(self.sid, name, _clone(data))
+
+    def begin_stage(self, stage, message, **extra):
+        self.current_stage = stage
+        if stage not in self.running_stages:
+            self.running_stages.add(stage)
+            self.emit(stage, 'start', message, **extra)
+
+    def finish_stage(self, stage, message):
+        self.running_stages.discard(stage)
+        self.emit(stage, 'done', message)
+
+
 
     def snapshot(self):
         paper = _clone(self.paper)
@@ -89,13 +104,14 @@ class WorkflowState:
                 q['reference_pages'] = mapped or q.get('reference_pages') or list(range(1, len(self.references) + 1))
                 q['source_pages'] = []
                 q.pop('source_page', None)
-        return _clone({'mode': self.mode, 'manifest': self.manifest, 'teacher_key': self.teacher_key,
+        state = {'mode': self.mode, 'manifest': self.manifest, 'teacher_key': self.teacher_key,
             'prefer_saved_answers': bool(self.meta.get('prefer_saved_answers')),
             'source_version': self.source_version, 'draft_version': self.draft_version,
             'source': self.source, 'answers': self.answers, 'review': self.review,
             'grades': self.grades, 'ocr_pages': self.ocr_pages,
             'positions_submitted': self.positions_submitted, 'selected_paper': paper,
-            'reference_pages': references})
+            'reference_pages': references}
+        return _clone(state)
 
     def _ids(self, rows, expected=None):
         if not isinstance(rows, list) or not rows or any(not isinstance(r, dict) for r in rows):
@@ -143,6 +159,15 @@ class WorkflowState:
 
     def submit_source(self, data):
         data = _clone(data)
+        if data.get('use_selected_paper') is True:
+            current = store.get_paper(self.meta.get('paper_id', ''))
+            if (not self.paper or not current or data.get('paper_id') != self.meta.get('paper_id') or
+                data.get('paper_id') != self.paper['id'] or type(data.get('paper_rev')) is not int or
+                data['paper_rev'] != self.paper.get('rev', 0) or data['paper_rev'] != current.get('rev', 0)):
+                raise ValueError('所选试卷 ID 或版本已变更，请重试以读取最新版本')
+            # Canonical text and source indexes are bound by the backend, never copied by the model.
+            data['questions'] = self.snapshot()['selected_paper']['questions']
+            data.setdefault('title', self.paper.get('title', ''))
         if data.get('multiple_students'):
             raise ValueError('材料包含多位学生，请分别提交每位学生的作答')
         rows = data.get('materials')
@@ -154,7 +179,7 @@ class WorkflowState:
         resolved = []
         for m in self.manifest:
             row = by_page[m['page']]
-            role = m.get('requested_role', 'auto')
+            role = m.get('classified_role') or m.get('requested_role', 'auto')
             if role == 'auto':
                 role = row.get('role')
                 if _confidence(row.get('confidence')) < .7:
@@ -218,7 +243,8 @@ class WorkflowState:
         has_teacher_material = any(m['role'] == 'answer_key' for m in resolved)
         same_questions = self.paper and {(str(q['id']), store.norm_answer(q['question'])) for q in self.paper['questions']} == {(q['id'], store.norm_answer(q['question'])) for q in questions}
         trusted = same_questions and cached and {str(a['id']) for a in cached} == set(ids) and all(
-            bool(str(a.get('answer', '')).strip()) and (a.get('review_status') in ('approved', 'manual_confirmed') or a.get('edited')) for a in cached)
+            bool(str(a.get('answer', '')).strip()) and (a.get('review_status') in ('approved', 'manual_confirmed') or a.get('edited') or
+                (a.get('review_status') == 'ai_solved' and a.get('solution_method') == 'single_agent')) for a in cached)
         if self.paper and (not same_questions or (not self.meta.get('paper_id') and not self._same_source_images(questions))):
             self.paper = None
             self.references = []
@@ -233,9 +259,59 @@ class WorkflowState:
                            'cached_paper_id': self.paper['id'], 'cached_paper_rev': self.paper.get('rev', 0)}
             self.paper_cache_hit = self.published = True
             self.emit('paper', 'done', '复用已复核的试卷版本')
-            self.emit('solve', 'skip', '复用已复核标准答案')
-            self.emit('answer_review', 'skip', '已有当前试卷版本的复核记录')
-        return {'source_version': self.source_version, 'cached_review': self.paper_cache_hit, 'next': 'get_state'}
+            if self.meta.get('execution_mode') not in ('single_agent', 'vision_agent'):
+                self.emit('solve', 'skip', '复用已复核标准答案')
+                self.emit('answer_review', 'skip', '已有当前试卷版本的复核记录')
+        return {'source_version': self.source_version, 'draft_version': self.draft_version,
+                'cached_review': self.paper_cache_hit,
+                'next': ('student-grader' if self.mode == 'grade' else 'finish') if self.review else 'submit_draft'}
+
+    def submit_single_result(self, data):
+        """Validate one agent's final result; these are storage checks, not model stages."""
+        source = {key: _clone(data[key]) for key in ('title', 'student_name', 'student_no',
+            'multiple_students', 'questions', 'reference_answers') if key in data}
+        source['materials'] = data.get('materials') or [{'page': m['page'],
+            'role': m.get('classified_role') or m.get('requested_role', 'auto'),
+            'confidence': m.get('classification_confidence', 1.)} for m in self.manifest]
+        if self.meta.get('paper_id'):
+            source.update(use_selected_paper=True, paper_id=self.paper['id'], paper_rev=self.paper.get('rev', 0))
+        self.submit_source(source)
+        if not self.review:
+            self.submit_draft({'answers': data.get('answers')})
+            teacher_material = bool(self.teacher_key.strip()) or any(
+                m['role'] == 'answer_key' for m in self.source['materials'])
+            for answer in self.answers:
+                answer['solution_method'] = 'single_agent'
+                if answer.get('review_status') == 'manual_confirmed':
+                    continue
+                if not teacher_material:
+                    answer.pop('teacher_answer', None)
+                teacher = answer.get('teacher_answer')
+                missing = teacher_material and not str(teacher or '').strip()
+                conflict = teacher is not None and not _review_agrees(answer, {
+                    'independent_answer': teacher, 'equivalent_to_draft': answer.get('teacher_equivalent') is True})
+                uncertain = answer.get('confident') is not True or not answer['answer'].strip()
+                uncertain |= answer.get('teacher_reference', {}).get('confident') is False
+                answer['review_status'] = 'review' if missing or conflict or uncertain else 'ai_solved'
+                answer['review_reason'] = ('老师答案与独立解题结果冲突' if conflict else
+                    '老师答案缺失或无法辨认' if missing else '独立解题把握不足' if uncertain else '')
+            # This is a source/confidence check of one solution, never a second reviewer.
+            self.review = {'source_version': self.source_version, 'draft_version': self.draft_version,
+                'method': 'single_agent', 'reviews': [{'id': a['id'], 'status': a['review_status'],
+                    'reason': a.get('review_reason', '')} for a in self.answers]}
+            self.persist('answer-solution.json', {'method': 'single_agent', 'answers': self.answers})
+            self.persist('answer-review.json', self.review)
+            self.publish_reviewed()
+        if self.mode == 'grade':
+            self.submit_grades({'source_version': self.source_version, 'draft_version': self.draft_version,
+                                'results': data.get('results')})
+            if not self.positions_submitted:
+                self.submit_positions({'positions': []})
+            total, maximum = data.get('total_score'), data.get('max_score')
+            if all(type(n) in (int, float) and math.isfinite(n) for n in (total, maximum)):
+                if not 0 <= total <= maximum or maximum <= 0:
+                    raise ValueError('总分或满分无效，请确认评分规则')
+                self.score_totals = {'total_score': total, 'max_score': maximum}
 
     def submit_draft(self, data):
         if not self.source:
@@ -339,15 +415,29 @@ class WorkflowState:
             if r['answer_state'] == 'blank' and str(r.get('student_answer', '')).strip(): reasons.append('空白状态与作答矛盾')
             if conf < .7: reasons.append('批改把握不足')
             verdict = 'wrong' if r['answer_state'] == 'blank' and not reasons else r.get('verdict')
+            label = str(questions[ident].get('question_label') or ident).strip() or ident
+            if label == ident and '.' not in ident:
+                label = str(r.get('question_label') or label).strip() or ident
             q = {**questions[ident], **r, 'id': ident, 'standard_answer': a['answer'], 'knowledge': a.get('knowledge', ''),
+                'question_label': label,
                 'grade_confidence': conf, 'parse_confidence': conf, 'reasons': reasons,
                 'verdict': verdict, 'status': 'review' if reasons or not verdict else verdict,
                 'draw': False, 'bbox_norm': None, 'bbox_px': None, 'bbox_ok': False,
-                'position_source': 'ocr_blocks', 'overridden': False, 'error_type': r.get('error_type', ''),
+                'position_source': 'vision' if self.meta.get('execution_mode') == 'vision_agent' else 'ocr_blocks', 'overridden': False, 'error_type': r.get('error_type', ''),
                 'position_note': '未定位到可靠的学生答案文字块，未落笔'}
             result.append(q)
         self.grades = result
         self.positions_submitted = False
+        if self.meta.get('execution_mode') == 'vision_agent':
+            apply_visual_fallback(self.grades, self.pages, direct=True)
+            for question in self.grades:
+                if not question['bbox_ok']:
+                    question['position_note'] = '模型未能确认本题位置，可在原图框选后标注'
+            self.positions_submitted = True
+            self.persist('grading.json', result)
+            self.persist('verified.json', result)
+            return {'graded': len(result), 'positioning_complete': not pending_positions(result),
+                    'unpositioned': [q['id'] for q in pending_positions(result)]}
         selections = [{'id': q['id'], 'page': q['page'], 'block_ids': q.get('answer_block_ids', [])}
                       for q in result if q.get('answer_block_ids')]
         if selections:
@@ -357,35 +447,14 @@ class WorkflowState:
                 apply_positions(self.grades, self.ocr_pages, self.pages, selections)
             except ValueError as exc:
                 self.emit('grade', 'info', f'判分已保存，部分 OCR 位置需补充：{exc}', kind='activity')
+        apply_visual_fallback(self.grades, self.pages)
+        missing = pending_positions(self.grades)
+        if not missing and work <= set(self.ocr_pages):
+            self.submit_positions({'positions': []})
         self.persist('grading.json', result)
-        return {'graded': len(result)}
+        return {'graded': len(result), 'positioning_complete': self.positions_submitted,
+                'unpositioned': [q['id'] for q in missing]}
 
-    async def ocr_page(self, data):
-        page = data.get('page')
-        if type(page) is not int or not 1 <= page <= len(self.pages):
-            raise ValueError('OCR 页码无效')
-        if page in self.ocr_pages:
-            return _clone(self.ocr_pages[page])
-        obj, error = {}, ''
-        for attempt in range(3):
-            try:
-                content = await asyncio.to_thread(imaging.jpeg_bytes, self.pages[page - 1])
-                obj = await ocr.recognize(self.cfg, content, f'page-{page}.jpg', purpose='rich_layout_recognition')
-                break
-            except ocr.OcrError as exc:
-                error = str(exc)
-                transient = any(x in error for x in ('429', '500', '502', '503', '504', 'Timeout', 'Connect', 'ReadError'))
-                if not transient or attempt == 2: break
-                await asyncio.sleep(.2 * (attempt + 1))
-        self.persist(f'ocr-page-{page}-raw.json', obj or {'error': error})
-        rows = obj.get('pages', [])
-        complete = len(rows) == 1 and all(r.get('finish_reason') in ('stop', 'end_turn') for r in rows)
-        blocks = ocr.parse_blocks(rows[0].get('text', '')) if complete else []
-        for block in blocks: block['id'] = f'p{page}:{block["id"]}'
-        result = {'page': page, 'blocks': blocks, 'complete': complete, 'error': error}
-        self.ocr_pages[page] = result
-        self.persist('ocr.json', self.ocr_pages)
-        return _clone(result)
 
     def submit_positions(self, data):
         if not self.grades:
@@ -400,62 +469,6 @@ class WorkflowState:
         self.persist('verified.json', self.grades)
         return result
 
-    async def authorize(self, data, tool_use_id, context):
-        name = data.get('tool_name', '')
-        role, aid = data.get('agent_type'), data.get('agent_id')
-        stage = {'submit_source': 'parse', 'submit_draft': 'solve', 'submit_review': 'answer_review', 'submit_grades': 'grade', 'ocr_page': 'ocr', 'submit_positions': 'locate'}.get(name.removeprefix('mcp__workflow__'))
-        if role in ('answer-reviewer', 'student-grader'):
-            stage = 'answer_review' if role == 'answer-reviewer' else 'grade'
-        if name == 'Agent':
-            stage = 'answer_review' if data.get('tool_input', {}).get('subagent_type') == 'answer-reviewer' else 'grade'
-        if stage: self.current_stage = stage
-        self.emit(self.current_stage, 'info', f"{role or 'main'}: {name}", kind='hook', agent_type=role, agent_id=aid)
-        child = bool(aid and role in ('answer-reviewer', 'student-grader'))
-        suffix = name.removeprefix('mcp__workflow__')
-        def deny(reason):
-            return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}
-        required = {'submit_review': 'answer-reviewer', 'submit_grades': 'student-grader'}
-        if suffix in required and (not child or role != required[suffix]):
-            return deny('此提交只能由指定的原生子代理执行')
-        if role and role not in ('main', 'answer-reviewer', 'student-grader'):
-            return deny('未知代理身份')
-        if child and suffix not in ('get_state', 'read_page', 'submit_review' if role == 'answer-reviewer' else 'submit_grades'):
-            return deny('子代理无权修改主代理阶段或调用其他工具')
-        if name == 'Agent':
-            if child or data.get('tool_input', {}).get('subagent_type') not in ('answer-reviewer', 'student-grader'):
-                return deny('只能调用指定工作流子代理')
-            return {}
-        if not name.startswith('mcp__workflow__'):
-            return deny('只允许任务作用域内工具')
-        caller = aid if child else 'main'
-        if suffix == 'read_page':
-            args = data.get('tool_input', {})
-            kind = 'reference' if 'reference' in args else 'page'
-            index = args.get(kind)
-            limit = len(self.references) if kind == 'reference' else len(self.pages)
-            if type(index) is not int or not 1 <= index <= limit:
-                return deny('页码无效')
-            path = self.references[index - 1]['path'] if kind == 'reference' else self.pages[index - 1]
-            try:
-                with Image.open(path) as image: image.verify()
-            except (OSError, ValueError):
-                return deny('来源图不存在或无法读取，不能作为已阅读证据')
-            if type(index) is int and 1 <= index <= limit:
-                self.reads.setdefault(caller, set()).add((kind, index))
-        if suffix == 'submit_source':
-            needed = {('page', m['page']) for m in self.manifest}
-            if not needed <= self.reads.get(caller, set()):
-                return deny('主代理必须先读取全部材料页图')
-        if self.source and suffix in required:
-            if role == 'student-grader':
-                needed = {('page', m['page']) for m in self.source['materials'] if m['role'] == 'student_work'}
-            else:
-                needed = {('page', p) for q in self.source['questions'] for p in q.get('source_pages', [])}
-                needed |= {('page', m['page']) for m in self.source['materials'] if m['role'] == 'answer_key'}
-                needed |= {('reference', p) for q in self.source['questions'] for p in q.get('reference_pages', [])}
-            if not needed <= self.reads.get(caller, set()):
-                return deny('子代理必须自己读取对应来源页图片，图片不会继承')
-        return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow'}}
 
     def restore_checkpoint(self):
         path = store.sub_dir(self.sid) / 'workflow-checkpoint.json'
@@ -518,12 +531,12 @@ class WorkflowState:
                 paper_id=self.meta['paper_id'], paper_rev=self.paper.get('rev', 0),
                 **{k: self.meta.get(k) or '' for k in ('class_id', 'task_id', 'student_id')})
         self.published = True
-        self.emit('paper', 'done', '已保存复核后的试卷与来源图')
+        self.emit('paper', 'done', '已保存标准答案与试卷来源图')
 
     def finalize(self):
         from .pipeline import render_annotations, summarize
         if not self.source or not self.answers or not self.review:
-            raise AgentError('工作流未完成当前版本的答案复核，模型最终文本不作为完成凭据')
+            raise AgentError('当前版本缺少完整题目或标准答案，无法保存结果')
         if self.mode == 'grade' and (self.grades is None or not self.positions_submitted):
             raise AgentError('工作流未完成批改或答案块定位提交')
         self.publish_reviewed()
@@ -534,12 +547,15 @@ class WorkflowState:
         student_id = self.meta.get('student_id')
         if not student_id and self.meta.get('class_id'):
             student_id = store.match_student(self.meta['class_id'], who.get('student_name', ''), who.get('student_no', ''))
-        result = {**{k: self.meta.get(k) for k in ('class_id', 'task_id', 'filename', 'file_key', 'created_at', 'inputs', 'input_version')},
+        result = {**self.score_totals, **{k: self.meta.get(k) for k in ('class_id', 'task_id', 'filename', 'file_key', 'created_at', 'inputs', 'input_version')},
             'id': self.sid, 'status': 'done', 'mode': self.mode, 'workflow_version': 2,
-            'position_method': 'ocr_blocks', 'annotation_version': ANNOTATION_VERSION, 'paper_id': pid,
+            'execution_mode': self.meta.get('execution_mode', 'native_agents'),
+            'position_method': 'visual_agent' if self.meta.get('execution_mode') == 'vision_agent' else 'ocr_blocks', 'annotation_version': ANNOTATION_VERSION, 'paper_id': pid,
             'paper_title': paper.get('title', ''), 'paper_rev': paper.get('rev', 0), 'paper_cache_hit': self.paper_cache_hit,
             'paper_similarity': 0, 'answer_source': paper.get('answer_source'), 'model': self.cfg.get('model'),
-            'ocr_used': bool(self.ocr_pages), 'ocr_mode': 'deepseek_ocr', 'effort': 'high',
+            'ocr_used': False if self.meta.get('execution_mode') == 'vision_agent' else bool(self.ocr_pages),
+            'ocr_mode': 'vision' if self.meta.get('execution_mode') == 'vision_agent' else 'deepseek_ocr', 'effort': 'high',
+            'vision_fallback_used': any(q.get('position_source') == 'vision_fallback' for q in questions),
             'student_id': student_id, 'student_match': 'manual' if self.meta.get('student_id') else 'auto' if student_id else None,
             'detected_name': who.get('student_name', ''), 'detected_no': who.get('student_no', ''),
             'materials': self.source['materials'], 'graded_pages': [m['page'] for m in self.source['materials'] if m['role'] == 'student_work'],
@@ -563,29 +579,19 @@ class WorkflowState:
 
 async def run_workflow(sid, cfg, meta, emit, teacher_key=''):
     start = time.monotonic()
+    meta = {**meta, 'execution_mode': 'vision_agent', 'ocr_mode': 'vision'}
     inputs = meta.get('inputs') or [{'original': meta['original'], 'filename': meta['filename'], 'role': 'auto'}]
     emit('preprocess', 'start', '转换全部材料为逐页图片')
     pages, manifest = await asyncio.to_thread(materials.to_pages, inputs, store.sub_dir(sid))
     emit('preprocess', 'done', f'共 {len(pages)} 页', page_count=len(pages))
     state = WorkflowState(sid, cfg, {**meta, 'inputs': inputs}, pages, manifest, emit, teacher_key)
-    if ocr.available(cfg):
-        emit('ocr', 'start', '先识别全部上传材料，文字块与坐标共享给后续 Agent')
-        limit = asyncio.Semaphore(3)
-        async def recognize(page):
-            async with limit:
-                result = await state.ocr_page({'page': page})
-                emit('ocr', 'info', f"第 {page} 页：{len(result['blocks'])} 个文字块" +
-                     ('' if result['complete'] else '，识别不完整，后续结合原图处理'), kind='activity')
-        await asyncio.gather(*(recognize(page) for page in range(1, len(pages) + 1)))
-        emit('ocr', 'done', f"已处理 {len(pages)} 页，共 {sum(len(p['blocks']) for p in state.ocr_pages.values())} 个文字块")
-    else:
-        emit('ocr', 'skip', '当前建库模型未配置 OCR，后续 Agent 读取原图')
-    state.restore_checkpoint()
-    emit('parse', 'start', '主代理阅读全部材料并提取题目')
-    await run_workflow_agent(cfg, state)
-    if state.mode == 'prepare':
-        for stage in ('grade', 'locate'):
-            emit(stage, 'skip', '准备试卷模式无需学生批改与定位')
+    state.begin_stage('process', '一个 Agent 正在理解材料、独立解题并对照学生答案',
+                      title='理解题目与独立解题' if state.mode == 'prepare' else '理解、解题与批改')
+    data = await run_single_agent(cfg, state)
+    state.submit_single_result(data)
+    state.finish_stage('process', '材料理解、独立解题与批改完成' if state.mode == 'grade' else '题目理解与独立解题完成')
+    if state.mode == 'grade':
+        emit('locate', 'done', f"位置校验完成，{len(pending_positions(state.grades))} 道题保留人工定位")
     emit('annotate', 'start', '保存结果并生成批改图片')
     result = await asyncio.to_thread(state.finalize)
     result['elapsed_s'] = round(time.monotonic() - start, 1)

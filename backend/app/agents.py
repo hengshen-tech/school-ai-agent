@@ -18,6 +18,8 @@ from .config import AGENT_TIMEOUT_S, WORK_DIR
 from claude_agent_sdk.types import StreamEvent
 
 _MODEL_LIMITS = weakref.WeakKeyDictionary()
+# Image-bearing MCP tool results exceed the SDK's default 1 MiB JSON limit.
+SDK_MAX_BUFFER_SIZE = 32 * 1024 * 1024
 
 
 def _model_limit():
@@ -31,7 +33,7 @@ class AgentError(RuntimeError):
     pass
 
 
-def _env(cfg: dict) -> dict:
+def _env(cfg: dict, effort="high") -> dict:
     m = cfg["model"]
     return {
         "ANTHROPIC_BASE_URL": cfg["base_url"].rstrip("/"),
@@ -46,28 +48,32 @@ def _env(cfg: dict) -> dict:
         "DISABLE_TELEMETRY": "1",
         "ENABLE_TOOL_SEARCH": "false",  # 第三方接口不认识延迟加载工具的占位符
         "API_TIMEOUT_MS": str(AGENT_TIMEOUT_S * 1000),
-        "CLAUDE_CODE_EFFORT_LEVEL": "high",
+        "CLAUDE_CODE_EFFORT_LEVEL": effort,
     }
 
 
 async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
                     allowed_tools: list | None = None, max_turns: int = 1, on_tool=None,
-                    emit=None, stage="model", label="") -> str:
+                    emit=None, stage="model", label="", effort="high", require_success=False,
+                    builtin_tools=None, work_dir=None, hooks=None, env_overrides=None) -> str:
     """运行一个 Agent 并返回它最后一段文本。blocks 为 Anthropic 格式的内容块（text / image）。"""
     if not cfg.get("api_key"):
         raise AgentError("尚未配置 API Key，请先到「模型设置」填写。")
     opts = ClaudeAgentOptions(
+        max_buffer_size=SDK_MAX_BUFFER_SIZE,
         system_prompt=system,
         model=cfg["model"],
-        env=_env(cfg),
-        tools=[],                 # 关闭 Claude Code 内置工具（读写文件、Bash 等），Agent 只能用我们给的工具
+        env={**_env(cfg, effort), **(env_overrides or {})},
+        tools=builtin_tools or [],
         setting_sources=[],       # 不加载任何本机 / 项目设置
         mcp_servers={"grader": mcp_server} if mcp_server else {},
+        strict_mcp_config=True,
         allowed_tools=allowed_tools or [],
         max_turns=max_turns,
-        cwd=str(WORK_DIR),
+        cwd=str(work_dir or WORK_DIR),
+        hooks=hooks,
         thinking={"type": "adaptive"},
-        effort="high",
+        effort=effort,
         include_partial_messages=True,
     )
     call_id = uuid.uuid4().hex[:12]
@@ -88,7 +94,7 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
 
     async def _go():
         nonlocal first_output, usage, last_activity
-        last_text, result, err = "", None, None
+        last_text, result, err, result_seen = "", None, None, False
         streamed = False
         async with ClaudeSDKClient(opts) as client:
             async def gen():
@@ -110,6 +116,8 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
                         last_activity = now
                         report("info", "模型正在思考", kind="activity")
                 elif isinstance(msg, AssistantMessage):
+                    if require_success and getattr(msg, 'stop_reason', None) == 'max_tokens':
+                        raise AgentError('模型输出被截断，请减少本次材料后重试')
                     texts = [b.text for b in msg.content if isinstance(b, TextBlock)]
                     if texts:
                         last_text = "\n".join(texts)
@@ -122,10 +130,16 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
                             if isinstance(b, ToolUseBlock):
                                 on_tool(b.name, b.input)
                 elif isinstance(msg, ResultMessage):
+                    result_seen = True
                     result = msg.result
                     usage = msg.usage
-                    if msg.is_error and msg.subtype != "error_max_turns":
+                    if require_success and (msg.subtype != 'success' or msg.is_error or
+                                            getattr(msg, 'stop_reason', None) == 'max_tokens'):
+                        err = '模型输出被截断' if getattr(msg, 'stop_reason', None) == 'max_tokens' else msg.result or msg.subtype
+                    elif msg.is_error and msg.subtype != "error_max_turns":
                         err = msg.result or msg.subtype
+        if require_success and not result_seen:
+            raise AgentError('模型未返回完成状态，请重试')
         if err:
             raise AgentError(f"模型调用失败：{str(err)[:400]}")
         return result or last_text
@@ -134,7 +148,7 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
         report("info", f"{label}等待模型调用名额".strip(), kind="activity")
         async with _model_limit():
             started_at = time.monotonic()
-            report("info", f"{label}模型开始处理（high）", kind="activity")
+            report("info", f"{label}模型开始处理（{effort}）", kind="activity")
             out = await asyncio.wait_for(_go(), AGENT_TIMEOUT_S)
     except asyncio.TimeoutError:
         raise AgentError("模型调用超时")
@@ -146,7 +160,7 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
         flush()
         now = time.monotonic()
         report("info", kind="metric", metric={"call_id": call_id, "stage": stage, "label": label,
-               "model": cfg["model"], "effort": "high", "usage": usage,
+               "model": cfg["model"], "effort": effort, "usage": usage,
                "queue_s": round((started_at or now) - queued_at, 3),
                "elapsed_s": round(now - started_at, 3) if started_at else 0,
                "first_output_s": round(first_output - started_at, 3) if first_output and started_at else None})
@@ -170,10 +184,10 @@ def extract_json(text: str) -> dict:
     return json.loads(t)
 
 
-async def run_json_agent(cfg, *, system, blocks, **kw) -> dict:
+async def run_json_agent(cfg, *, system, blocks, attempts=2, **kw) -> dict:
     """运行 Agent 并解析 JSON；解析失败时带着提醒重试一次。"""
     last = None
-    for attempt in range(2):
+    for attempt in range(attempts):
         if attempt and kw.get("emit"):
             kw["emit"](kw.get("stage", "model"), "info", "模型输出不是合法 JSON，正在重试一次")
         b = blocks if attempt == 0 else blocks + [
@@ -187,79 +201,3 @@ async def run_json_agent(cfg, *, system, blocks, **kw) -> dict:
         except Exception as e:
             last = e
     raise AgentError(f"模型输出无法解析为 JSON（{last}）")
-
-
-def workflow_options(cfg, state):
-    """One SDK session, two real native Agent definitions, no shell/filesystem tools."""
-    from claude_agent_sdk import AgentDefinition, HookMatcher
-    from . import prompts
-    from .workflow_tools import TOOL_NAMES, create_tools
-    from . import store
-    names = [f'mcp__workflow__{name}' for name in TOOL_NAMES]
-    common = ['mcp__workflow__get_state', 'mcp__workflow__read_page']
-    page_budget = len(state.pages) + len(state.references)
-    child_turns = 2 * page_budget + 16
-    return ClaudeAgentOptions(
-        system_prompt=prompts.WORKFLOW_MAIN, model=cfg['model'], env={**_env(cfg),
-            'CLAUDE_CONFIG_DIR': str(store.sub_dir(state.sid) / 'sdk-config'),
-            'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1'},
-        tools=['Agent'], allowed_tools=['Agent', *names], setting_sources=[],
-        mcp_servers={'workflow': create_tools(state)},
-        agents={
-            'answer-reviewer': AgentDefinition(description='Independent source and standard answer reviewer',
-                prompt=prompts.ANSWER_REVIEW_AGENT, background=False, maxTurns=child_turns, tools=[*common, 'mcp__workflow__submit_review']),
-            'student-grader': AgentDefinition(description='Read student pages and grade all questions against reviewed key',
-                prompt=prompts.STUDENT_GRADER_AGENT, background=False, maxTurns=child_turns, tools=[*common, 'mcp__workflow__submit_grades'])},
-        hooks={'PreToolUse': [HookMatcher(hooks=[state.authorize])]},
-        cwd=str(WORK_DIR), max_turns=4 * page_budget + 32, include_partial_messages=True,
-        thinking={'type': 'adaptive'}, effort='high')
-
-
-async def run_workflow_agent(cfg, state):
-    """Keep one persistent main client; never treat exhausted loops as completion."""
-    if not cfg.get('api_key'):
-        raise AgentError('尚未配置 API Key，请先到「模型设置」填写。')
-    options = workflow_options(cfg, state)
-    started = time.monotonic()
-    call_id = uuid.uuid4().hex[:12]
-    async def run():
-        result_seen = False
-        streamed_parents = set()
-        child_names = {}
-        def emit_text(message, text):
-            parent = getattr(message, 'parent_tool_use_id', None)
-            role = child_names.get(parent, 'main')
-            label = {'main': '主 Agent', 'answer-reviewer': '答案审核子 Agent', 'student-grader': '学生批改子 Agent'}.get(role, role)
-            state.emit(state.current_stage, 'output', kind='output', text=text,
-                       call_id=f'{call_id}:{parent or "main"}', label=label)
-        async with ClaudeSDKClient(options) as client:
-            await client.query('执行本任务。先调用 get_state，完整阅读材料并通过各阶段工具提交。')
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    parent = getattr(message, 'parent_tool_use_id', None)
-                    for block in message.content:
-                        if isinstance(block, TextBlock) and parent not in streamed_parents:
-                            emit_text(message, block.text)
-                        elif isinstance(block, ToolUseBlock):
-                            if block.name in ('Agent', 'Task'):
-                                child_names[block.id] = block.input.get('subagent_type', 'main')
-                            state.emit(state.current_stage, 'info', f'调用 {block.name}', kind='activity')
-                    streamed_parents.discard(parent)
-                elif isinstance(message, StreamEvent):
-                    delta = message.event.get('delta', {})
-                    if delta.get('type') == 'text_delta':
-                        streamed_parents.add(getattr(message, 'parent_tool_use_id', None))
-                        emit_text(message, delta.get('text', ''))
-                elif isinstance(message, ResultMessage):
-                    result_seen = True
-                    state.emit('parse', 'info', kind='metric', metric={'call_id': call_id, 'stage': 'workflow', 'label': '主代理及原生子代理',
-                        'model': cfg['model'], 'effort': 'high', 'usage': message.usage, 'elapsed_s': round(time.monotonic() - started, 3), 'queue_s': 0})
-                    if message.is_error or message.subtype != 'success':
-                        raise AgentError(f'工作流未完成：{message.result or message.subtype}')
-        if not result_seen:
-            raise AgentError('工作流会话未返回完成状态')
-    try:
-        async with _model_limit():
-            await asyncio.wait_for(run(), AGENT_TIMEOUT_S)
-    except asyncio.TimeoutError as exc:
-        raise AgentError('工作流模型调用超时，可重试恢复已复核阶段') from exc

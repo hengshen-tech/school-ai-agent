@@ -82,20 +82,6 @@ async def test_settings():
         return {"ok": False, "error": str(e)}
 
 
-@app.post("/api/ocr/text")
-async def ocr_text(file: UploadFile = File(...)):
-    """用 DeepSeek OCR 读取老师上传的答案文件（PDF / Word / PPT / 图片），返回纯文字供老师确认。"""
-    cfg = config.load_settings()
-    if not ocr.available(cfg):
-        raise HTTPException(400, "读取答案文件需要 DeepSeek 接口（模型设置里填 DeepSeek 的地址和 Key）")
-    data = await file.read()
-    if len(data) > MAX_BYTES:
-        raise HTTPException(400, "文件超过 40MB")
-    try:
-        obj = await ocr.recognize(cfg, data, Path(file.filename or "answer").name, "text_recognition")
-    except ocr.OcrError as e:
-        raise HTTPException(502, str(e))
-    return {"text": ocr.plain_text(obj), "page_count": obj.get("page_count")}
 
 
 # ---------- 批改 ----------
@@ -115,12 +101,10 @@ async def create_submission(file: UploadFile | None = File(None), answer_key: st
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     cfg = config.load_settings()
-    if ocr_mode not in ("", "deepseek_ocr"):
-        raise HTTPException(400, "新批改统一使用 DeepSeek OCR，请先配置 DeepSeek 接口")
-    if mode == "grade" and not ocr.available(cfg):
-        raise HTTPException(400, "批改需要 DeepSeek OCR，请先配置 DeepSeek 接口和 API Key")
-    ocr_mode = "deepseek_ocr"
-    cfg = {**cfg, "use_ocr": mode == "grade"}
+    if ocr_mode not in ("", "vision", "deepseek_ocr"):
+        raise HTTPException(400, "识别模式无效")
+    ocr_mode = "vision"  # Legacy clients may still send deepseek_ocr; new jobs never use OCR.
+    cfg = {**cfg, "use_ocr": False}
     ro = store.roster()
     if task_id:
         t = next((t for t in ro["tasks"] if t["id"] == task_id), None)
@@ -229,9 +213,7 @@ def _restart(sid, retry=False):
     # Retry keeps input/model choices, but always uses the current credential.
     if retry and record:
         cfg.update(record.get("settings", {}))
-    cfg["use_ocr"] = mode == "grade"
-    if mode == "grade" and not ocr.available(cfg):
-        raise HTTPException(400, "当前配置无法使用此任务的 DeepSeek OCR 模式，请先恢复接口设置")
+    cfg["use_ocr"] = False
     new = store.new_id("sub")
     d = store.sub_dir(new)
     d.mkdir(parents=True)
@@ -244,7 +226,7 @@ def _restart(sid, retry=False):
     meta.update(filename=previous["filename"], created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                 original=inputs[0]["original"], inputs=inputs, input_version=original_meta.get("input_version", 1),
                 file_hash=materials.bundle_hash(loaded, modern=original_meta.get("input_version", 1) >= 2),
-                ocr_mode="deepseek_ocr", mode=mode, workflow_version=2,
+                ocr_mode="vision", mode=mode, workflow_version=2,
                 paper_id=original_meta.get("paper_id") or "")
     meta["file_key"] = store.workflow_file_key(meta["file_hash"], mode=mode, paper_id=meta["paper_id"],
                                               task_id=meta["task_id"], student_id=meta["student_id"], class_id=meta["class_id"])
@@ -353,7 +335,8 @@ async def manual_position(sid: str, body: PositionIn):
     from PIL import Image
     with Image.open(path) as image:
         pixels = imaging.norm_to_px(box, *image.size)
-    draw = q.get('status') in ('correct', 'wrong', 'partial')
+    draw = q.get('status') in (('correct', 'wrong', 'partial', 'review')
+        if r.get('execution_mode') == 'vision_agent' else ('correct', 'wrong', 'partial'))
     q.update(bbox_norm=box, bbox_px=pixels, bbox_ok=True, draw=draw,
              position_source='manual', annotation_anchor='answer', ocr_block_ids=[],
              position_note='' if draw else '已定位学生答案，人工确认后即可标记')
@@ -371,6 +354,10 @@ async def override(sid: str, body: OverrideIn):
     q = next((q for q in r["questions"] if q["id"] == body.qid), None)
     if not q:
         raise HTTPException(404, "题目不存在")
+    if q.get('status') != body.status:
+        # A changed verdict has no implied numeric score without a scoring rubric.
+        q.pop('score', None)
+        r.pop('total_score', None)
     q.update(status=body.status, overridden=True,
              draw=bool(q.get("bbox_px")) and (bool(q.get("bbox_ok")) if r.get("workflow_version") == 2 else True))
     r["summary"] = summarize(r["questions"])

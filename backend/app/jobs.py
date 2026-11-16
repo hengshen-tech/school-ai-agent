@@ -44,8 +44,6 @@ class JobManager:
         event = {"id": record.get("last_event_id", 0) + 1, "stage": stage,
                  "status": status, "message": message, "t": now, "kind": "status", **extra}
         record["last_event_id"] = event["id"]
-        with (store.sub_dir(sid) / "events.jsonl").open("a", encoding="utf-8") as out:
-            out.write(json.dumps(event, ensure_ascii=False) + "\n")
         if "page_count" in extra:
             record["page_count"] = extra["page_count"]
         for field in ("paper_id", "workflow_version", "mode"):
@@ -58,14 +56,22 @@ class JobManager:
             record["stage"] = stage
             steps = record.setdefault("stages", {})
             step = steps.setdefault(stage, {})
-            if status == "start":
+            running = step.get('started_at') is not None and step.get('status') in ('start', 'info')
+            if status == "start" and not running:
                 step["started_at"] = now
+                step.pop('finished_at', None)
+                step.setdefault('elapsed_s', 0)
+            if status in {"done", "skip", "error"}:
+                step['elapsed_s'] = round(step.get('elapsed_s', 0) +
+                    (max(0, now - step['started_at']) if running else 0), 3)
+                step['finished_at'] = now
+                record.setdefault('timings', {})[stage] = step['elapsed_s']
             step.update(status=status, message=message, t=now)
             if "title" in extra:
                 step["title"] = extra["title"]
-            if status in {"done", "skip", "error"} and step.get("started_at"):
-                step["elapsed_s"] = round(now - step["started_at"], 3)
-                record.setdefault("timings", {})[stage] = step["elapsed_s"]
+            event.update({k: step[k] for k in ('started_at', 'finished_at', 'elapsed_s') if k in step})
+        with (store.sub_dir(sid) / "events.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(event, ensure_ascii=False) + "\n")
         # Output is already durable in the append-only event log. Snapshot it at
         # stage boundaries instead of rewriting a growing JSON for every delta.
         if event["kind"] == "status":
@@ -76,6 +82,8 @@ class JobManager:
     def start(self, sid, cfg, meta, teacher_key=""):
         now = time.time()
         meta = {**meta, "position_method": "ocr_blocks" if meta.get("ocr_mode") == "deepseek_ocr" else "visual_review"}
+        if meta.get('workflow_version') == 2:
+            meta.update(execution_mode='vision_agent', ocr_mode='vision', position_method='visual_agent')
         record = {"id": sid, "meta": meta, "teacher_key": teacher_key,
                   "settings": {k: cfg.get(k) for k in ("model", "base_url", "agentic_zoom", "use_ocr")},
                   "status": "queued", "created_at": now, "stages": {}, "timings": {},
@@ -165,6 +173,7 @@ class JobManager:
                     "ocr_mode": result.get("ocr_mode", "deepseek_ocr" if result.get("ocr_used") else "vision"),
                     "position_method": result.get("position_method"),
                     "mode": result.get("mode", "grade"), "workflow_version": result.get("workflow_version", 1),
+                    "execution_mode": result.get('execution_mode'),
                     "paper_id": result.get("paper_id"),
                     "last_event_id": 0, "task_id": result.get("task_id", "")}
         now = record.get("finished_at") or time.time()
@@ -180,6 +189,7 @@ class JobManager:
                 "position_method": meta.get("position_method"),
                 "model": record.get("settings", {}).get("model", ""), "effort": "high",
                 "mode": meta.get("mode", "grade"), "workflow_version": meta.get("workflow_version", 1),
+                "execution_mode": meta.get('execution_mode'),
                 "paper_id": record.get("paper_id") or meta.get("paper_id"),
                 "timings": record.get("timings", {}), "stages": record.get("stages", {}),
                 "last_event_id": record.get("last_event_id", 0),

@@ -26,7 +26,7 @@
   <section id="view-work" class="view on">
     <div id="home">
       <h1 id="uploadTitle">今天批改哪一份？</h1>
-      <p class="lead" id="uploadLead">添加试卷、可选参考答案和一位学生的作答。先审核标准答案，再批改，最后用 DeepSeek OCR 定位并标注。</p>
+      <p class="lead" id="uploadLead">添加试卷、可选参考答案和一位学生的作答。一个 Agent 直接看图，按需放大、解题和复核，生成红勾、红叉及黄问号。</p>
       <label id="drop" class="drop">
         <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden>
         <div class="drop-icon">＋</div>
@@ -38,7 +38,6 @@
       <div class="pick">
         <label>处理方式<select id="uMode"><option value="grade">批改学生作答</option><option value="prepare">仅解题并存入试卷库</option></select></label>
         <label id="uPaperWrap">使用已备试卷<select id="uPaper"><option value="">从本次材料识别试卷</option></select></label>
-        <input id="uOcr" type="hidden" value="deepseek_ocr">
         <label id="uClassWrap">班级<select id="uClass"></select></label>
         <label id="uTaskWrap">任务<select id="uTask"></select></label>
         <label id="uStudentWrap">学生<select id="uStudent"></select></label>
@@ -150,15 +149,11 @@
     <p class="lead">通过 Claude Agent SDK 调用任意 Anthropic 兼容接口。默认配置为 DeepSeek V4.1 Flash。</p>
     <form id="setForm" class="card form">
       <label>模型名称<input id="sModel" placeholder="deepseek-flash" required>
-        <small>DeepSeek V4.1 Flash 的模型 ID 是 <code>deepseek-flash</code>，必须是支持图片输入的模型。</small></label>
+        <small>DeepSeek V4.1 Flash 的模型 ID 是 <code>deepseek-flash</code>，必须是支持图片输入和工具调用的模型。</small></label>
       <label>接口地址（Base URL）<input id="sUrl" placeholder="https://api.deepseek.com/anthropic" required>
         <small>填 Anthropic 兼容地址，结尾不要带 <code>/v1</code>。</small></label>
       <label>API Key<input id="sKey" type="password" autocomplete="off" placeholder="sk-…">
         <small id="keyHint">保存在服务端数据卷中，页面上不会回显。</small></label>
-      <label class="check" hidden><input type="checkbox" id="sZoom"> 历史视觉复核设置
-        <small>仅视觉识别模式生效；接口不支持工具返回图片时会自动降级为普通复核。</small></label>
-      <label class="check" hidden><input type="checkbox" id="sOcr"> 历史 OCR 设置
-        <small id="ocrHint"></small></label>
       <div class="row"><button class="primary" type="submit">保存</button>
         <button class="ghost" type="button" id="testBtn">测试连接</button><span id="setMsg"></span></div>
     </form>

@@ -261,7 +261,7 @@ test('start sends every material once with roles and selected student, while ret
   assert.equal(uploads[0].body.get('file'),null);
   assert.equal(uploads[0].body.get('file_roles'),'["question_paper","auto"]');
   assert.equal(uploads[0].body.get('student_id'),'student');assert.equal(uploads[0].body.get('answer_key'),'1. A');
-  assert.equal(uploads[0].body.get('ocr_mode'),'deepseek_ocr');
+  assert.equal(uploads[0].body.get('ocr_mode'),'vision');
   s.run('stageFiles([{name:"next.png",size:5}]);show_("settings")');
   s.el('#answerKey').value='new answer';
   uploads[0].resolve({ok:true,json:async()=>({id:'bundle',cached:false})});await uploading;
@@ -286,11 +286,11 @@ test('materials can be removed and invalid file sets are rejected before uploadi
   s.run('stageFiles(Array.from({length:6},()=>({name:"x.pdf",size:40*1024*1024})))');assert.equal(s.run('stagedFiles.length'),1);
   assert.match(s.el('#uploadErr').textContent,/200/);
 });
-test('new uploads always use OCR and never fall back to vision',()=>{
-  const s=setup();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  s.el('#uOcr').value='vision';s.el('#uOcr').onchange({target:s.el('#uOcr')});
-  s.run('syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
+test('new uploads always use vision without OCR',()=>{
+  const s=setup();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');
+  assert.equal(s.run('homeOcrMode'),'vision');
+  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');
+  assert.equal(s.run('defaultOcrMode()'),'vision');
 });
 test('task file selection moves to staged home with task context and no upload',async()=>{
   const s=taskHarness();await s.run('openTask("A")');
@@ -353,7 +353,7 @@ test('task material selection keeps the prior draft separate and restores all of
   const s=taskHarness();
   s.run('settingsCache={ocr_available:true};syncOcrSelectors();classes=[{id:"class",name:"班级"}];allTasks=[{id:"A",class_id:"class",title:"A"}];allStudents=[{id:"student-A",class_id:"class",name:"学生A"}];fillUploadPickers();stageFiles([{name:"A.pdf",size:10}],"student_work")');
   s.el('#uClass').value='class';s.run('fillTaskStudent()');s.el('#uTask').value='A';s.el('#uStudent').value='student-A';
-  s.el('#answerKey').value='A标准答案';s.el('#uOcr').value='vision';s.el('#uOcr').onchange({target:s.el('#uOcr')});
+  s.el('#answerKey').value='A标准答案';
   await s.run('openTask("B")');s.el('#tFile').onchange({target:{files:[{name:'B.pdf',size:10}],value:'x'}});
   assert.equal(s.run('stagedFiles.length'),1);assert.equal(s.run('stagedFiles[0].file.name'),'B.pdf');
   assert.equal(s.el('#answerKey').value,'');assert.equal(s.el('#uTask').value,'B');
@@ -362,7 +362,7 @@ test('task material selection keeps the prior draft separate and restores all of
   s.run(`switchUploadDraft(${previous})`);
   assert.equal(s.run('stagedFiles[0].file.name'),'A.pdf');assert.equal(s.run('stagedFiles[0].role'),'student_work');
   assert.equal(s.el('#answerKey').value,'A标准答案');assert.equal(s.el('#uClass').value,'class');
-  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
+  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.run('homeOcrMode'),'vision');
   await s.run('openTask("B")');s.el('#tFile').onchange({target:{files:[{name:'B-2.png',size:10}],value:'x'}});
   assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.run('stagedFiles[0].file.name'),'B.pdf');assert.equal(s.el('#answerKey').value,'');
 });
@@ -405,13 +405,93 @@ test('task import validates the saved destination draft limit without changing t
   assert.equal(s.run('[...uploadDrafts.values()].find(draft=>draft.task_id==="B").files.length'),20);
 });
 
-test('task uploads normalize historical vision drafts to OCR',async()=>{
+test('task uploads normalize historical OCR drafts to vision',async()=>{
   const s=taskHarness();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');
   await s.run('openTask("B")');
   s.el('#tFile').onchange({target:{files:[{name:'one.png',size:10}],value:'x'}});
-  assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  await s.run('openTask("B")');s.el('#tOcr').value='vision';s.el('#tOcr').onchange({target:s.el('#tOcr')});
+  assert.equal(s.run('homeOcrMode'),'vision');
+  await s.run('openTask("B")');
   s.el('#tFile').onchange({target:{files:[{name:'two.png',size:10}],value:'x'}});
-  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  assert.equal(s.run('uploadDrafts.get(activeDraftId).ocr_mode'),'deepseek_ocr');
+  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.run('homeOcrMode'),'vision');
+  assert.equal(s.run('uploadDrafts.get(activeDraftId).ocr_mode'),'vision');
+});
+
+test('repeated stage starts do not reset time and later attempts accumulate',()=>{
+  const s=setup();
+  s.run('stageState={};applyJobEvent({id:1,stage:"parse",status:"start",t:100});applyJobEvent({id:2,stage:"parse",status:"start",t:110});applyJobEvent({id:3,stage:"parse",status:"done",t:120})');
+  assert.equal(s.run('stageState.parse.elapsed_s'),20);
+  s.run('applyJobEvent({id:4,stage:"parse",status:"start",t:150});applyJobEvent({id:5,stage:"parse",status:"done",t:155})');
+  assert.equal(s.run('stageState.parse.elapsed_s'),25);
+});
+test('running steps add current processing time to previously completed time',()=>{
+  const s=setup();
+  s.run('stageState={parse:{status:"start",started_at:100,elapsed_s:20}};renderSteps(stageState)');
+  assert.notEqual(s.el('#steps [data-stage="parse"] .stage-time').textContent,'20.0s');
+});
+
+test('single-agent jobs show one reasoning step and hide legacy model stages',()=>{
+  const s=setup();
+  s.run('activeJob={execution_mode:"single_agent",workflow_version:2,mode:"grade"};renderSteps({process:{status:"start",started_at:100}})');
+  assert.equal(s.el('#steps [data-stage="process"]').hidden,false);
+  for(const key of ['parse','solve','answer_review','grade','review']) assert.equal(s.el(`#steps [data-stage="${key}"]`).hidden,true);
+});
+
+function reviewFixture(s) {
+  const questions=[{id:'1',page:3,status:'review',draw:false,bbox_ok:true,bbox_px:[30,40,60,70],student_answer:'2',answer_state:'answered',question:'1+1=',standard_answer:'2',reasons:[]},
+    {id:'2',page:4,status:'review',draw:false,bbox_ok:true,bbox_px:[30,40,60,70],student_answer:'4',answer_state:'answered',question:'2+2=',standard_answer:'4',reasons:[]}];
+  const job={id:'bundle-review',page_count:4,materials:[{page:1,role:'question_paper',filename:'paper.pdf',source_page:1},
+    {page:3,role:'student_work',filename:'work-a.png',source_page:1},{page:4,role:'student_work',filename:'work-b.png',source_page:1}],
+    questions,summary:{correct:0,wrong:0,partial:0,review:2,accuracy:0}};
+  s.run(`cur=${JSON.stringify(job)};page=1;kind="raw"`);
+  return job;
+}
+test('manual correct switches from another file to the question annotated page',async()=>{
+  const s=setup(), job=reviewFixture(s);
+  job.questions[0]={...job.questions[0],status:'correct',draw:true,overridden:true};
+  s.context.fetch=async()=>({ok:true,json:async()=>job});
+  const button={dataset:{q:'1',s:'correct'}};
+  s.context.document.querySelectorAll=selector=>selector==='#qlist button[data-q]'?[button]:[];
+  s.run('drawResult()');await button.onclick();
+  assert.equal(s.run('page'),3);
+  assert.equal(s.run('kind'),'annotated');
+  assert.match(s.el('#pageImg').src,/pages\/3\?kind=annotated/);
+});
+test('manual review on the raw student page opens the annotated view',async()=>{
+  const s=setup(), job=reviewFixture(s);
+  s.run('page=4;kind="raw"');job.questions[1]={...job.questions[1],status:'wrong',draw:true};
+  s.context.fetch=async()=>({ok:true,json:async()=>job});
+  await s.run('applyManualOverride("2","wrong")');
+  assert.equal(s.run('page'),4);assert.equal(s.run('kind'),'annotated');
+});
+test('rapid manual reviews wait for prior updates and retain both decisions',async()=>{
+  const s=setup(), job=reviewFixture(s), calls=[];
+  let release;
+  s.context.fetch=async(url,opt)=>{
+    const data=JSON.parse(opt.body);calls.push(data.qid);
+    if(calls.length===1) await new Promise(resolve=>release=resolve);
+    job.questions=job.questions.map(q=>q.id===data.qid?{...q,status:data.status,draw:true}:q);
+    return {ok:true,json:async()=>structuredClone(job)};
+  };
+  const first=s.run('applyManualOverride("1","correct")');
+  const second=s.run('applyManualOverride("2","wrong")');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(calls,['1']);release();await Promise.all([first,second]);
+  assert.equal(s.run('cur.questions[0].status'),'correct');
+  assert.equal(s.run('cur.questions[1].status'),'wrong');
+  assert.equal(s.run('page'),4);
+});
+test('marked-but-undrawn answers can be repositioned and show their source file',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.questions[0].status="correct";cur.questions[0].position_note="答案旁没有可用的标注空间";drawResult()');
+  assert.match(s.el('#qlist').innerHTML,/data-position="1"/);
+  assert.match(s.el('#qlist').innerHTML,/work-a.png/);
+});
+
+test('hierarchical question labels display without changing manual review IDs',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.questions[0].question_label="1.1";cur.questions[1].question_label="2.1";drawResult();beginManualPosition("1")');
+  assert.match(s.el('#qlist').innerHTML,/<span class="q-id">1\.1<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/<span class="q-id">2\.1<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/data-q="1"/);
+  assert.match(s.el('#positionHint').textContent,/第 1\.1 题/);
 });

@@ -76,7 +76,7 @@ def test_existing_job_replays_saved_selections_and_keeps_manual_verdict(tmp_path
     assert repaired['questions'][1]['status'] == 'review' and not repaired['questions'][1]['draw']
     assert (d / 'annotated/page-1.png').is_file()
     with Image.open(d / 'annotated/page-1.png') as image:
-        assert any(r > 150 and g < 100 and b < 100 for r, g, b in image.getdata())
+        assert any((r > 150 and g < 100 and b < 100) or (g > 100 and r < 100 and b < 100) for r, g, b in image.getdata())
     assert ensure_workflow_annotations(sid, repaired) == repaired
 
 
@@ -104,3 +104,31 @@ def test_manual_position_can_draw_after_correct_override(tmp_path):
         assert q['bbox_norm'] == [100, 200, 200, 250]
         bad = client.post(f'/api/submissions/{sid}/position', json={'qid': '1', 'bbox': [100, 200, 1200, 250]})
         assert bad.status_code == 400
+
+
+@pytest.mark.parametrize('status', ['correct', 'wrong'])
+def test_manual_override_marks_only_the_student_page_in_multiple_files(tmp_path, status):
+    import io
+    sid = 'sub_multifile_manual_marks'
+    folder = store.sub_dir(sid)
+    (folder / 'pages').mkdir(parents=True)
+    for page, size in enumerate(((180, 240), (300, 400), (600, 800)), 1):
+        Image.new('RGB', size, 'white').save(folder / 'pages' / f'page-{page}.png')
+    store.save_result(sid, {'id': sid, 'filename': 'multiple-files', 'workflow_version': 2, 'annotation_version': 4,
+        'page_count': 3, 'graded_pages': [2, 3], 'materials': [
+            {'page': 1, 'source_page': 1, 'filename': 'paper.png', 'role': 'question_paper'},
+            {'page': 2, 'source_page': 1, 'filename': 'work-a.png', 'role': 'student_work'},
+            {'page': 3, 'source_page': 1, 'filename': 'work-b.png', 'role': 'student_work'}],
+        'questions': [{'id': '7', 'page': 3, 'status': 'review', 'draw': False,
+            'bbox_norm': [200, 200, 300, 250], 'bbox_px': [120, 160, 180, 200], 'bbox_ok': True}]})
+    with TestClient(main.app) as client:
+        updated = client.post(f'/api/submissions/{sid}/override', json={'qid': '7', 'status': status})
+        assert updated.status_code == 200
+        question = updated.json()['questions'][0]
+        assert question['page'] == 3 and question['draw'] and question['status'] == status
+        for page in (1, 2, 3):
+            rendered = client.get(f'/api/submissions/{sid}/pages/{page}?kind=annotated')
+            assert rendered.status_code == 200
+            with Image.open(io.BytesIO(rendered.content)).convert('RGB') as image:
+                marked = any((r > 150 and g < 100 and b < 100) or (g > 100 and r < 100 and b < 100) for r, g, b in image.getdata())
+                assert marked is (page == 3)

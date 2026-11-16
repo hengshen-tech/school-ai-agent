@@ -16,18 +16,21 @@ const post = (url, body, method = "POST") => api(url, { method, headers: JSON_H,
 const LABEL = { correct: "正确", wrong: "错误", partial: "部分正确", review: "待复核" };
 const STEPS = [
   ["preprocess", "预处理", "PDF / 图片转为逐页图片"],
-  ["ocr", "DeepSeek OCR", "先识别全部材料，文字块与坐标共享给后续 Agent"],
+  ["classify", "识别材料用途", "先区分试卷、标准答案与学生答卷"],
+  ["ocr", "DeepSeek OCR", "仅识别学生答卷，文字块与坐标随原图传入"],
+  ["process", "理解、解题与批改", "一个 Agent 根据完整材料自主理解题目、独立解题并对照学生作答"],
   ["parse", "理解材料", "主 Agent 阅读材料，区分试卷、参考答案和学生作答"],
   ["paper", "试卷库匹配", "判断是否为已批改过的同一套试卷"],
   ["solve", "独立解题", "主 Agent 根据原题生成答案草稿"],
   ["answer_review", "标准答案审核", "审核子 Agent 独立验算，争议题等待人工确认"],
   ["grade", "学生作答批改", "批改子 Agent 读取学生答卷，对照已审核答案判定"],
-  ["locate", "答案定位", "主 Agent 对应答案文字块，无法定位时保留判分"],
+  ["locate", "答案定位", "程序校验答案文字块与坐标，无法定位时保留判分"],
   ["review", "复核 Agent", "逐题放大核对抄录与位置"],
   ["annotate", "标注", "在卷面绘制对错号"],
 ];
 let cur = null, page = 1, kind = "annotated", es = null, backTo = null, taskTimer = null;
 let manualPosition = null;
+let manualReviewQueue = Promise.resolve();
 let classes = [], allStudents = [], allTasks = [];
 let activeJob = null, viewGeneration = 0, stageState = {}, seenEvents = new Set(), lastEventId = 0;
 let stageFolds = {}, jobsCache = [], jobsLoading = false, settingsCache = {};
@@ -52,16 +55,9 @@ function stopWatching() {
 function clearGradingRoute() {
   if (gradingRoute(location.hash)) history.replaceState(null, "", location.pathname + location.search);
 }
-function defaultOcrMode() { return "deepseek_ocr"; }
-function ocrOptions() {
-  return `<option value="deepseek_ocr">DeepSeek OCR</option>`;
-}
-function syncOcrSelectors() {
-  const node = $("#uOcr");
-  node.innerHTML = ocrOptions();
-  node.value = homeOcrMode = "deepseek_ocr";
-  node.onchange = () => { node.value = homeOcrMode = "deepseek_ocr"; saveUploadDraft(); renderUploadDrafts(); };
-}
+function defaultOcrMode() { return "vision"; }
+function syncOcrSelectors() { homeOcrMode = "vision"; }
+
 
 /* ---------- 导航 ---------- */
 $$("nav button").forEach((b) => (b.onclick = () => show(b.dataset.view)));
@@ -90,9 +86,7 @@ const stuLabel = (s) => (s.no ? s.no + " " : "") + s.name;
 /* ---------- 设置 ---------- */
 async function loadSettings() {
   const s = await api("/api/settings"); settingsCache = s; syncOcrSelectors();
-  $("#sModel").value = s.model; $("#sUrl").value = s.base_url; $("#sZoom").checked = s.agentic_zoom;
-  $("#sOcr").checked = s.use_ocr;
-  $("#ocrHint").textContent = "新批改统一使用 DeepSeek OCR。历史开关只用于读取旧配置。";
+  $("#sModel").value = s.model; $("#sUrl").value = s.base_url;
   $("#sKey").value = ""; $("#sKey").placeholder = s.has_key ? `已保存（${s.api_key_masked}），留空则不修改` : "sk-…";
   badge(s);
 }
@@ -100,7 +94,7 @@ function badge(s) {
   $("#modelBadge").innerHTML = `<span class="dot ${s.has_key ? "ok" : ""}"></span><b>${esc(s.model)}</b><br>${s.has_key ? esc(s.base_url) : "尚未填写 API Key"}`;
 }
 async function saveSettings() {
-  await post("/api/settings", { model: $("#sModel").value, base_url: $("#sUrl").value, api_key: $("#sKey").value, agentic_zoom: $("#sZoom").checked, use_ocr: $("#sOcr").checked }, "PUT");
+  await post("/api/settings", { model: $("#sModel").value, base_url: $("#sUrl").value, api_key: $("#sKey").value }, "PUT");
   await loadSettings();
 }
 $("#setForm").onsubmit = async (e) => { e.preventDefault(); await saveSettings(); msg("已保存", true); };
@@ -188,7 +182,7 @@ function updateUploadMode() {
   $("#uploadTitle").textContent = uploadMode === "prepare" ? "先备好这套试卷" : "今天批改哪一份？";
   $("#uploadLead").textContent = uploadMode === "prepare"
     ? "上传试卷和可选参考答案。主 Agent 独立解题，审核子 Agent 核对后存入试卷库，争议题可人工确认。"
-    : "添加试卷、可选参考答案和一位学生的作答。先审核标准答案，再批改，最后用 DeepSeek OCR 定位并标注。";
+    : "添加试卷、可选参考答案和一位学生的作答。一个 Agent 直接看图，按需裁剪放大、独立解题、批改和复核，生成红勾、红叉及黄问号。";
 }
 $("#uMode").onchange = (e) => { uploadMode = e.target.value === "prepare" ? "prepare" : "grade"; updateUploadMode(); renderMaterials(); };
 $("#uPaper").onchange = (e) => { selectedPaperId = e.target.value; saveUploadDraft(); };
@@ -247,7 +241,7 @@ async function uploadFromHome(files) {
   if (error) return;
   saveUploadDraft();
   const snapshot = stagedFiles.map((x) => ({...x})), uploadGeneration = viewGeneration, submittedDraftId = activeDraftId;
-  const extra = {mode: uploadMode, ocr_mode: "deepseek_ocr", answer_key: $("#answerKey").value,
+  const extra = {mode: uploadMode, ocr_mode: "vision", answer_key: $("#answerKey").value,
     ...(uploadMode === "grade" ? {paper_id:selectedPaperId, class_id:$("#uClass").value, task_id:$("#uTask").value, student_id:$("#uStudent").value} : {})};
   const from = extra.task_id ? () => openTask(extra.task_id) : null;
   const name = snapshot.map((x) => x.file.name).join("、");
@@ -321,14 +315,19 @@ function renderSteps(state, reset = false) {
     const node = $(`#steps [data-stage="${k}"]`); if (!node) continue;
     const st = state[k] || {}, cls = {start:"run",info:"run",done:"done",skip:"skip",error:"fail",interrupted:"fail"}[st.status] || "";
     node.className = cls;
-    node.hidden = k === "review" ? activeJob?.workflow_version === 2 || !state.review
-      : ["answer_review", "locate"].includes(k) && activeJob?.workflow_version === 1;
+    node.hidden = ["single_agent", "vision_agent"].includes(activeJob?.execution_mode)
+      ? ["parse", "solve", "answer_review", "grade", "review"].includes(k) ||
+        (activeJob?.execution_mode === "vision_agent" && ["classify", "ocr"].includes(k)) ||
+        (k === "paper" && !state.paper) || (k === "locate" && activeJob?.mode === "prepare")
+      : k === "process" || (k === "review" ? activeJob?.workflow_version === 2 || !state.review
+        : ["answer_review", "locate"].includes(k) && activeJob?.workflow_version === 1);
     const ocrPosition = k === "review" && activeJob?.position_method === "ocr_blocks";
     node.querySelector("b").textContent = st.title || stepName(k);
     const effort = node.querySelector(".effort"); if (effort) effort.hidden = ocrPosition;
     node.querySelector(".ico").textContent = {done:"✓",skip:"↷",fail:"!"}[cls] || "";
     node.querySelector(".stage-summary").textContent = st.message || (ocrPosition ? "使用 OCR 答案文字块坐标，无需调用复核 Agent" : desc);
-    const elapsed = st.elapsed_s ?? (st.started_at && cls === "run" ? Date.now()/1000 - st.started_at : null);
+    const elapsed = st.started_at != null && cls === "run"
+      ? (st.elapsed_s || 0) + Math.max(0, Date.now()/1000 - st.started_at) : st.elapsed_s;
     node.querySelector(".stage-time").textContent = elapsed == null ? "" : seconds(elapsed);
     const detail = node.querySelector(".stage-detail"), open = stageFolds[k] ?? cls === "run";
     detail._defaultOpen = open; if (detail.open !== open) detail.open = open;
@@ -362,13 +361,18 @@ function applyJobEvent(e) {
   }
   else {
     if (e.message) st.logs.push(e.message);
-    if (e.kind === "metric" && e.metric) st.logs.push(`${e.metric.label || "模型调用"} · ${e.metric.model || ""} · high · ${modelMetricText(e.metric)}`);
+    if (e.kind === "metric" && e.metric) st.logs.push(`${e.metric.label || "模型调用"} · ${e.metric.model || ""} · ${e.metric.effort || "high"} · ${modelMetricText(e.metric)}`);
     if ((!e.kind || e.kind === "status") && (!old.t || !e.t || e.t >= old.t)) {
+      const running = old.started_at != null && ["start","info"].includes(old.status);
       Object.assign(st,e);
-      if (e.status === "start") { st.started_at = e.t; delete st.elapsed_s; }
-      if (["done","skip","error"].includes(e.status) && st.started_at && e.t) st.elapsed_s = e.t - st.started_at;
+      if (e.status === "start") {
+        st.started_at = e.started_at ?? (running ? old.started_at : e.t);
+        st.elapsed_s = e.elapsed_s ?? old.elapsed_s ?? 0;
+      }
+      if (["done","skip","error"].includes(e.status)) {
+        st.elapsed_s = e.elapsed_s ?? ((old.elapsed_s || 0) + (running && e.t != null ? Math.max(0, e.t - old.started_at) : 0));
+      }
     }
-    if (e.elapsed_s != null) st.elapsed_s = e.elapsed_s;
   }
   return true;
 }
@@ -436,7 +440,7 @@ async function watch(id, name, from) {
 function showJobFailure(message) {
   for (const st of Object.values(stageState)) if (["start","info"].includes(st.status)) {
     st.status = "error"; st.message = message || "批改已中断";
-    if (st.started_at) st.elapsed_s = (activeJob?.finished_at || Date.now()/1000) - st.started_at;
+    if (st.started_at != null) st.elapsed_s = (st.elapsed_s || 0) + Math.max(0, (activeJob?.finished_at || Date.now()/1000) - st.started_at);
   }
   renderSteps(stageState);
   $("#jobNotice").textContent = "批改未完成：" + (message || "服务已中断，可重试"); $("#retryJob").hidden = false;
@@ -486,14 +490,15 @@ async function openResult(id, fileCached, from, generation) {
   STEPS.forEach(([k]) => (state[k] = {...state[k], status: state[k]?.status || "done", elapsed_s:r.timings?.[k] ?? state[k]?.elapsed_s}));
   if (r.paper_cache_hit) state.solve = {...state.solve, status: "skip", message: "命中试卷库，直接复用已保存的标准答案" };
   state.paper = {...state.paper, status: "done", message: r.paper_cache_hit ? `命中「${r.paper_title}」（相似度 ${Math.round(r.paper_similarity * 100)}%）` : "新试卷，已存入试卷库" };
-  if (!r.ocr_used) state.ocr = {...state.ocr, status: "skip", message: "本次未使用（非 DeepSeek 接口、已关闭或未返回坐标）" };
+  if (!r.ocr_used && r.execution_mode !== "vision_agent") state.ocr = {...state.ocr, status: "skip", message: "本次未使用（非 DeepSeek 接口、已关闭或未返回坐标）" };
   renderSteps(state);
   const b = [];
   if (fileCached || activeJob.fileCached) b.push(`<span class="chip accent">同一文件 · 直接读取上次结果</span>`);
   b.push(r.paper_cache_hit ? `<span class="chip accent">命中试卷库 · 未重新计算答案</span>` : `<span class="chip">新试卷 · 答案已入库</span>`);
   if (r.student_match === "auto") b.push(`<span class="chip accent">按卷面姓名自动归档</span>`);
   else if (!r.student_id && r.detected_name) b.push(`<span class="chip review">卷面姓名「${esc(r.detected_name)}」未匹配到学生</span>`);
-  if (r.ocr_used) b.push(`<span class="chip accent">${r.position_method === "ocr_blocks" ? "OCR 坐标直接标注" : "DeepSeek OCR 辅助定位"}</span>`);
+  if (r.execution_mode === "vision_agent") b.push(`<span class="chip accent">纯视觉 · 动态放大复核</span>`);
+  else if (r.ocr_used) b.push(`<span class="chip accent">${r.vision_fallback_used ? "OCR＋模型辅助定位" : r.position_method === "ocr_blocks" ? "OCR 坐标直接标注" : "DeepSeek OCR 辅助定位"}</span>`);
   b.push(`<span class="chip">推理强度 ${esc(r.effort || "high")}</span>`);
   b.push(`<span class="chip">答案来源：${r.answer_source === "teacher" ? "老师" : "AI"}</span>`, `<span class="chip">${esc(r.model)}</span>`, `<span class="chip">${r.elapsed_s}s</span>`);
   $("#dBadges").innerHTML = b.join("");
@@ -545,7 +550,7 @@ function beginManualPosition(qid) {
   if (!q) return;
   cancelManualPosition(); page = q.page; kind = "raw";
   manualPosition = {sid:cur.id, qid, page, generation:viewGeneration};
-  $("#positionHint").textContent = `请在原图上拖动框选第 ${qid} 题的学生答案，松开后保存位置`;
+  $("#positionHint").textContent = `${q.position_note && !q.draw ? q.position_note + "。" : ""}请在${questionPageLabel(q)}原图上拖动框选第 ${questionLabel(q)} 题的学生答案，松开后保存位置`;
   $("#manualPositionTools").hidden = false;
   $("#pageImg").classList.add("positioning");
   drawPage();
@@ -608,6 +613,38 @@ function renderMetrics(r) {
   box.innerHTML = `<summary>耗时与模型调用</summary><p class="sub">总耗时 ${seconds(r.elapsed_s)} · 排队 ${seconds(r.queue_s)}</p>${timings.map(([k,v])=>`<div class="metric-row"><span>${esc(stepName(k,r))}</span><b>${seconds(v)}</b></div>`).join("")}${(r.model_calls||[]).map((m)=>`<div class="metric-row"><span>${esc(m.label || stepName(m.stage,r) || m.name || "模型调用")} · ${esc(m.model || r.model)} · ${esc(m.effort || "high")}<small>${esc(modelMetricText(m))}</small></span></div>`).join("")}`;
 }
 
+function questionLabel(q) { return q.question_label || q.id; }
+function questionPageLabel(q) {
+  const material = cur?.materials?.find((m) => m.page === q.page);
+  return material ? `${material.filename || "文件"} 第 ${material.source_page || 1} 页` : `第 ${q.page} 页`;
+}
+function applyManualOverride(qid, status) {
+  const id = cur?.id, generation = viewGeneration;
+  const valid = () => generation === viewGeneration && cur?.id === id;
+  if (!id) return Promise.resolve();
+  // Each response contains the whole result. Keep updates in click order so a
+  // slower response cannot replace a later review with an older snapshot.
+  const edit = async () => {
+    if (!valid()) return;
+    try {
+      const r = await post(`/api/submissions/${id}/override`, {qid, status});
+      if (!valid()) return;
+      cur = r;
+      const q = cur.questions.find((q) => q.id === qid);
+      cancelManualPosition();
+      if (q) page = q.page;
+      kind = "annotated";
+      $("#jobNotice").textContent = "";
+      drawResult();
+      if (q && (!q.bbox_ok || !q.bbox_px || !q.draw)) beginManualPosition(q.id);
+      else drawPage();
+    } catch (error) {
+      if (valid()) $("#jobNotice").textContent = `人工改判未保存：${error.message}`;
+    }
+  };
+  manualReviewQueue = manualReviewQueue.then(edit, edit);
+  return manualReviewQueue;
+}
 function drawResult() {
   const s = cur.summary;
   $("#summary").hidden = false;
@@ -623,25 +660,19 @@ function drawResult() {
     const notes = [];
     if (q.status === "review") notes.push(`<p class="q-note">${esc(q.reasons.join("；") || "未能得出结论")}${q.verdict ? ` · AI 倾向：${LABEL[q.verdict]}` : ""}</p>`);
     else if (q.reason && q.status !== "correct") notes.push(`<p class="q-note plain">${esc(q.reason)}${q.error_type ? ` · 错因：${esc(q.error_type)}` : ""}</p>`);
+    if (q.position_source === "vision_fallback") notes.push(`<p class="q-note plain">位置由模型看图推断，可用「框选答案位置」修正。</p>`);
     if (q.position_note && !q.draw) notes.push(`<p class="q-note">${esc(q.position_note)}</p>`);
     const btn = (st, t) => `<button title="${LABEL[st]}" class="${q.status === st ? "on" : ""}" data-q="${esc(q.id)}" data-s="${st}">${t}</button>`;
     return `<div class="q ${q.status}">
-      <div class="q-top"><span class="q-id">${esc(q.id)}</span>
+      <div class="q-top"><span class="q-id">${esc(questionLabel(q))}</span>
         <span class="q-ans">学生：<b>${ans}</b> <s>· 标准答案：${esc(q.standard_answer ?? "缺失")}</s></span>
         <span class="chip ${q.status}">${LABEL[q.status]}${q.overridden ? " · 人工" : ""}</span></div>
       <p class="q-stem">${esc(q.question)}</p>${notes.join("")}
-      <div class="q-act">人工改判 ${btn("correct", "✓")}${btn("partial", "½")}${btn("wrong", "✗")}${!q.bbox_ok || !q.bbox_px ? `<button data-position="${esc(q.id)}">框选答案位置</button>` : ""}<span>第 ${q.page} 页${q.knowledge ? " · " + esc(q.knowledge) : ""}${q.ocr_confirmed ? " · OCR 印证" : ""}</span></div>
+      <div class="q-act">人工改判 ${btn("correct", "✓")}${btn("partial", "½")}${btn("wrong", "✗")}${!q.bbox_ok || !q.bbox_px || ["vision", "vision_fallback"].includes(q.position_source) || (!q.draw && q.status !== "review") ? `<button data-position="${esc(q.id)}">框选答案位置</button>` : ""}<span>${esc(questionPageLabel(q))}${q.knowledge ? " · " + esc(q.knowledge) : ""}${q.ocr_confirmed ? " · OCR 印证" : ""}</span></div>
     </div>`;
   }).join("");
   $$("#qlist button[data-position]").forEach((b) => (b.onclick = () => beginManualPosition(b.dataset.position)));
-  $$("#qlist button[data-q]").forEach((b) => (b.onclick = async () => {
-    const id = cur?.id, generation = viewGeneration; if (!id) return;
-    const r = await post(`/api/submissions/${id}/override`, { qid: b.dataset.q, status: b.dataset.s });
-    if (generation !== viewGeneration || cur?.id !== id) return;
-    cur = r; drawResult(); drawPage();
-    const q = cur.questions.find((q) => q.id === b.dataset.q);
-    if (q && (!q.bbox_ok || !q.bbox_px)) beginManualPosition(q.id);
-  }));
+  $$("#qlist button[data-q]").forEach((b) => (b.onclick = () => applyManualOverride(b.dataset.q, b.dataset.s)));
 }
 $("#back").onclick = () => {
   stopWatching(); clearGradingRoute(); activeJob = null; cur = null; $("#desk").hidden = true; $("#home").hidden = false;
@@ -808,7 +839,6 @@ async function openTask(id) {
   const stuOpts = opts(t.rows, stuLabel, "选择学生…");
   d.innerHTML = `<div class="page-head"><button class="ghost" id="tBack">← 返回</button>
       <div class="grow"><h1>${esc(t.title)}</h1><p class="sub">${esc(t.class_name)} · ${t.paper_title ? "试卷：" + esc(t.paper_title) : "上传第一份试卷后自动绑定试卷"}</p></div>
-      <input type="hidden" id="tOcr" value="deepseek_ocr">
       <label class="ghost" style="cursor:pointer">添加本次批改材料（可多选）<input type="file" id="tFile" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden></label>
       <button class="ghost" id="tReport">学情报告</button><button class="ghost danger" id="tDel">删除任务</button></div>
     ${tiles([[`${done} / ${t.rows.length}`, "已交"], [t.rows.length - done, "未交", t.rows.length - done ? "warn" : ""], [running.length, "批改中"],
@@ -828,8 +858,6 @@ async function openTask(id) {
         <td class="num">${r.sid ? `${r.summary.correct} / ${r.summary.wrong + r.summary.partial} / ${r.summary.review}` : ""}</td>
         <td class="num">${r.sid ? `<span class="link" data-sub="${r.sid}">查看</span> · <a class="link" href="/api/submissions/${r.sid}/pdf">PDF</a>` : ""}</td></tr>`).join("")}</tbody></table>`
       : `<p class="sub">这个班级还没有学生，请先到「班级管理」添加花名册。</p>`}</div>`;
-  $("#tOcr").value = "deepseek_ocr";
-  $("#tOcr").onchange = () => { $("#tOcr").value = "deepseek_ocr"; taskOcrModes.set(id, "deepseek_ocr"); };
   bindJobs(d, () => openTask(id));
   $("#tBack").onclick = () => show("tasks");
   $("#tDel").onclick = async () => { if (confirm("删除这个任务？已批改的试卷不会删除。")) { await api(`/api/tasks/${id}`, { method: "DELETE" }); if (taskValid()) show("tasks"); } };
@@ -837,7 +865,7 @@ async function openTask(id) {
   $$("[data-sub]", d).forEach((x) => (x.onclick = () => openResult(x.dataset.sub, false, () => openTask(id))));
   $$("[data-assign]", d).forEach((x) => (x.onchange = async () => { if (x.value) { await post(`/api/submissions/${x.dataset.assign}/assign`, { student_id: x.value }); if (taskValid()) openTask(id); } }));
   $("#tFile").onchange = (e) => {
-    const files = [...e.target.files], ocrMode = $("#tOcr").value || defaultOcrMode(); e.target.value = "";
+    const files = [...e.target.files], ocrMode = defaultOcrMode(); e.target.value = "";
     if (!files.length || !taskValid()) return;
     const current = snapshotUploadDraft();
     const saved = current.task_id === id ? [activeDraftId,current]
@@ -849,7 +877,7 @@ async function openTask(id) {
     saveUploadDraft();
     const draftId = saved?.[0] || ++nextDraftId;
     const additions = files.map((file) => ({id:++nextMaterialId,file,role:"auto"}));
-    uploadDrafts.set(draftId, {...target,files:[...target.files,...additions],mode:"grade",paper_id:t.paper_id || target.paper_id || "",ocr_mode:"deepseek_ocr",error:""});
+    uploadDrafts.set(draftId, {...target,files:[...target.files,...additions],mode:"grade",paper_id:t.paper_id || target.paper_id || "",ocr_mode:"vision",error:""});
     if (!classes.some((c) => c.id === t.class_id)) classes.push({id:t.class_id, name:t.class_name});
     if (!allTasks.some((task) => task.id === id)) allTasks.push({...t,id});
     show_("work"); cur = null; activeJob = null;
@@ -950,9 +978,9 @@ async function openPaper(id) {
     <p class="sub">${esc(p.id)} · 答案版本 ${p.rev || 0} · 修改或确认后，打开批改记录点「重新批改」即可生效</p>
     ${(p.reference_pages || []).length ? `<details class="paper-sources"><summary>查看试卷原图</summary>${p.reference_pages.map((ref) => `<a class="link" href="/api/papers/${encodeURIComponent(id)}/pages/${ref.page}" target="_blank" rel="noopener">原图第 ${ref.page} 页</a>`).join(" · ")}</details>` : ""}
     <table><thead><tr><th>题号</th><th>题目</th><th style="width:26%">标准答案</th><th style="width:22%">知识点</th></tr></thead><tbody>
-    ${p.questions.map((q) => { const a = amap[q.id] || {}; return `<tr><td>${esc(q.id)}</td><td>${esc(q.question)}</td>
-      <td><input aria-label="第 ${esc(q.id)} 题标准答案" data-id="${esc(q.id)}" data-f="answer" value="${esc(a.answer ?? "")}">
-        <small class="answer-review ${a.review_status === "review" ? "pending" : ""}">${({approved:"审核通过",review:"待人工确认",manual_confirmed:"已人工确认"})[a.review_status] || "历史答案，使用前需审核"}</small>
+    ${p.questions.map((q) => { const a = amap[q.id] || {}; return `<tr><td>${esc(questionLabel(q))}</td><td>${esc(q.question)}</td>
+      <td><input aria-label="第 ${esc(questionLabel(q))} 题标准答案" data-id="${esc(q.id)}" data-f="answer" value="${esc(a.answer ?? "")}">
+        <small class="answer-review ${a.review_status === "review" ? "pending" : ""}">${({approved:"审核通过",ai_solved:"AI 独立解题",review:"待人工确认",manual_confirmed:"已人工确认"})[a.review_status] || "历史答案，使用前需审核"}</small>
         ${a.teacher_answer ? `<small class="answer-evidence">老师答案：${esc(a.teacher_answer)}</small>` : ""}
         ${a.review_answer || a.independent_answer ? `<small class="answer-evidence">独立验算：${esc(a.review_answer || a.independent_answer)}</small>` : ""}
         ${a.review_reason ? `<small class="answer-evidence">${esc(a.review_reason)}</small>` : ""}

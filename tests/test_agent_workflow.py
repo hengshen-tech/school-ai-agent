@@ -1,5 +1,4 @@
 """Backend-enforced workflow contracts; no credentials or real student data."""
-import asyncio
 import os
 import sys
 import tempfile
@@ -89,40 +88,15 @@ def test_pending_grade_keeps_validated_location_for_manual_override(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_page_tool_limits_image_dimensions(tmp_path, monkeypatch):
+async def test_direct_page_input_limits_image_dimensions(tmp_path, monkeypatch):
     import base64
     import io
     from app import imaging
-    from app.workflow_tools import read_page_image
     s = state(tmp_path, monkeypatch)
     monkeypatch.setattr(imaging, 'MODEL_IMAGE_MAX_SIDE', 80)
-    result = await read_page_image(s, {'page': 1})
-    block = result['content'][0]
+    block = imaging.page_block(s.pages[0])['source']
     with Image.open(io.BytesIO(base64.b64decode(block['data']))) as image:
         assert max(image.size) <= 80
-
-
-@pytest.mark.asyncio
-async def test_workflow_stream_is_not_duplicated_by_final_message(tmp_path, monkeypatch):
-    from app import agents
-    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
-    from claude_agent_sdk.types import StreamEvent
-    s = state(tmp_path, monkeypatch)
-    events = []
-    s.emit = lambda stage, status, message='', **extra: events.append(extra)
-    class Client:
-        def __init__(self, options): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def query(self, prompt): pass
-        async def receive_response(self):
-            yield StreamEvent(uuid='stream', session_id='s', event={'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'checked'}})
-            yield AssistantMessage(content=[TextBlock(text='checked')], model='test')
-            yield ResultMessage(subtype='success', duration_ms=1, duration_api_ms=1, is_error=False,
-                                num_turns=1, session_id='s', result='checked', usage={})
-    monkeypatch.setattr(agents, 'ClaudeSDKClient', Client)
-    await agents.run_workflow_agent({'model': 'mock', 'base_url': 'http://localhost', 'api_key': 'fake'}, s)
-    assert ''.join(e.get('text', '') for e in events if e.get('kind') == 'output') == 'checked'
 
 
 def attempted_ocr(s):
@@ -199,77 +173,6 @@ def test_position_validation_page_qualified_no_reuse_and_no_guessed_box(tmp_path
     assert not s.grades[0]['draw'] and s.grades[0]['position_note']
 
 
-@pytest.mark.asyncio
-async def test_hook_checks_native_child_identity(tmp_path, monkeypatch):
-    s = state(tmp_path, monkeypatch)
-    denied = await s.authorize({'tool_name': 'mcp__workflow__submit_review', 'agent_type': 'student-grader', 'agent_id': 'child'}, None, None)
-    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
-    allowed = await s.authorize({'tool_name': 'mcp__workflow__submit_review', 'agent_type': 'answer-reviewer', 'agent_id': 'child'}, None, None)
-    assert allowed['hookSpecificOutput']['permissionDecision'] == 'allow'
-    denied = await s.authorize({'tool_name': 'mcp__workflow__submit_grades'}, None, None)
-    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
-
-
-@pytest.mark.asyncio
-async def test_ocr_all_input_pages_before_grades_and_rejects_truncation(tmp_path, monkeypatch):
-    from app import ocr
-    s = state(tmp_path, monkeypatch)
-    with pytest.raises(ValueError): await s.ocr_page({'page': 0})
-    calls = []
-    async def recognize(*args, **kwargs):
-        calls.append(kwargs)
-        return {'pages': [{'text': '<｜ref｜>text<｜/ref｜><｜box｜>[[1,2,8,9]]<｜/box｜>2', 'finish_reason': 'length'}]}
-    monkeypatch.setattr(ocr, 'recognize', recognize)
-    await s.ocr_page({'page': 1})
-    result = await s.ocr_page({'page': 2})
-    assert result['blocks'] == [] and result['complete'] is False
-    await s.ocr_page({'page': 2})
-    assert len(calls) == 2
-    assert calls[0]['purpose'] == 'rich_layout_recognition'
-
-
-def test_native_options_restrict_tools_and_define_two_agents(tmp_path, monkeypatch):
-    from app.agents import workflow_options
-    s = state(tmp_path, monkeypatch)
-    opts = workflow_options({'model': 'mock', 'base_url': 'http://localhost', 'api_key': 'fake'}, s)
-    assert opts.tools == ['Agent']
-    assert set(opts.agents) == {'answer-reviewer', 'student-grader'}
-    assert all(a.background is False for a in opts.agents.values())
-    assert opts.agents['answer-reviewer'].tools == ['mcp__workflow__get_state', 'mcp__workflow__read_page', 'mcp__workflow__submit_review']
-    assert all(x == 'Agent' or x.startswith('mcp__workflow__') for x in opts.allowed_tools)
-    assert opts.hooks['PreToolUse']
-
-
-@pytest.mark.asyncio
-async def test_hook_requires_child_read_own_pages_before_submission(tmp_path, monkeypatch):
-    s = state(tmp_path, monkeypatch); reviewed(s)
-    data = {'tool_name': 'mcp__workflow__submit_grades', 'agent_type': 'student-grader', 'agent_id': 'g',
-            'tool_input': {'data': {'source_version': 1, 'draft_version': 1}}}
-    denied = await s.authorize(data, None, None)
-    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
-    await s.authorize({'tool_name': 'mcp__workflow__read_page', 'agent_type': 'student-grader', 'agent_id': 'g',
-                       'tool_input': {'page': 2}}, None, None)
-    assert (await s.authorize(data, None, None))['hookSpecificOutput']['permissionDecision'] == 'allow'
-
-
-@pytest.mark.asyncio
-async def test_persistent_main_client_error_max_turns_is_failure(tmp_path, monkeypatch):
-    from app import agents
-    from claude_agent_sdk import ResultMessage
-    s = state(tmp_path, monkeypatch)
-    opened = []
-    class Client:
-        def __init__(self, options): opened.append(options)
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def query(self, prompt): assert isinstance(prompt, str)
-        async def receive_response(self):
-            yield ResultMessage(subtype='error_max_turns', duration_ms=1, duration_api_ms=1, is_error=True,
-                                num_turns=80, session_id='mock', result='done')
-    monkeypatch.setattr(agents, 'ClaudeSDKClient', Client)
-    with pytest.raises(AgentError, match='未完成'):
-        await agents.run_workflow_agent({'model': 'mock', 'base_url': 'http://localhost', 'api_key': 'fake'}, s)
-    assert len(opened) == 1
 
 
 @pytest.mark.parametrize('mode', ['grade', 'prepare'])
@@ -314,61 +217,6 @@ def test_selected_paper_manual_answers_are_preserved(tmp_path, monkeypatch):
     s.submit_review({'source_version': 1, 'draft_version': s.draft_version, 'reviews': [{'id': '1', 'status': 'approved', 'independent_answer': '2'}]})
     assert s.answers[0]['answer'] == 'teacher'
     assert s.answers[0]['review_status'] == 'manual_confirmed'
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(not os.environ.get('RUN_NATIVE_SDK_TEST'), reason='Explicit local SDK subprocess integration')
-@pytest.mark.parametrize('mode', ['prepare', 'grade'])
-async def test_actual_sdk_native_agents_use_their_own_page_tools(tmp_path, monkeypatch, mode):
-    import socket
-    import subprocess
-    import httpx
-    from app.workflow import run_workflow
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
-    env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parent), 'WORKFLOW_MOCK_SINGLE_QUESTION': '1'}
-    server = subprocess.Popen([sys.executable, '-m', 'uvicorn', 'mock_llm:app', '--host', '127.0.0.1', '--port', str(port)], env=env,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        async with httpx.AsyncClient() as client:
-            for _ in range(100):
-                try:
-                    await client.get(f'http://127.0.0.1:{port}/log'); break
-                except httpx.ConnectError: await asyncio.sleep(.1)
-        monkeypatch.setattr(store, 'SUBS_DIR', tmp_path / 'subs')
-        monkeypatch.setattr(store, 'PAPERS_DIR', tmp_path / 'papers')
-        monkeypatch.setattr(store, 'FILE_INDEX', tmp_path / 'index.json')
-        monkeypatch.setenv('DEEPSEEK_OCR_URL', f'http://127.0.0.1:{port}/v1/tools/ocr')
-        d = store.sub_dir('native'); d.mkdir(parents=True)
-        p = d / 'input.png'; Image.new('RGB', (100, 100), 'white').save(p)
-        cfg = {'model': 'mock', 'api_key': 'test-only', 'base_url': f'http://127.0.0.1:{port}'}
-        meta = {'mode': mode, 'filename': 'synthetic.png', 'inputs': [{'original': str(p), 'filename': 'synthetic.png',
-                'role': 'question_paper' if mode == 'prepare' else 'student_work'}]}
-        
-        events = []
-        try:
-            result = await run_workflow('native', cfg, meta, lambda *a, **kw: events.append((a, kw)))
-        except Exception:
-            async with httpx.AsyncClient() as client:
-                print([e for e in events if e[1].get('kind') == 'hook'][:20])
-                print([r for r in (await client.get(f'http://127.0.0.1:{port}/log')).json() if r['role'] == 'main'][-2:])
-            raise
-        assert result['mode'] == mode
-        async with httpx.AsyncClient() as client:
-            log = (await client.get(f'http://127.0.0.1:{port}/log')).json()
-        children = [r for r in log if r['role'] in ('answer-reviewer', 'student-grader')]
-        assert log[0]['role'] == 'OCR'
-        assert sum(r['role'] == 'OCR' for r in log) == 1
-        assert any(r['role'] == 'answer-reviewer' and r['tool_result_images'] > 0 for r in children)
-        assert any(r['role'] == 'answer-reviewer' and r.get('shared_ocr_blocks') == 1 for r in children)
-        assert all(r['images'] == 0 for r in children)
-        if mode == 'grade':
-            assert any(r['role'] == 'student-grader' and r['tool_result_images'] > 0 for r in children)
-            assert any(r['role'] == 'student-grader' and r.get('shared_ocr_blocks') == 1 for r in children)
-            assert result['questions'][0]['draw']
-            assert result['questions'][0]['ocr_block_ids'] == ['p1:b1']
-    finally:
-        server.terminate(); server.wait(timeout=10)
 
 
 def test_review_publishes_before_grading_and_reuses_without_revision_bump(tmp_path, monkeypatch):
@@ -512,27 +360,6 @@ def test_selected_paper_snapshot_maps_sources_to_archived_references(tmp_path, m
     assert question['source_pages'] == [] and question['reference_pages'] == [1]
     second.submit_source({'materials': [{'page': 1, 'role': 'student_work'}], 'questions': [question]})
     assert second.review
-
-
-def test_option_turn_limits_cover_maximum_material_bundle(tmp_path, monkeypatch):
-    from app.agents import workflow_options
-    s = state(tmp_path, monkeypatch)
-    s.pages = s.pages * 20
-    opts = workflow_options({'model': 'mock', 'base_url': 'http://localhost', 'api_key': 'fake'}, s)
-    assert opts.max_turns >= 2 * len(s.pages) + 12
-    assert all(a.maxTurns >= len(s.pages) + 4 for a in opts.agents.values())
-
-
-@pytest.mark.asyncio
-async def test_failed_image_read_cannot_satisfy_review_gate(tmp_path, monkeypatch):
-    s = state(tmp_path, monkeypatch); reviewed(s)
-    s.pages[0].unlink()
-    denied = await s.authorize({'tool_name': 'mcp__workflow__read_page', 'agent_type': 'answer-reviewer',
-                                'agent_id': 'reviewer', 'tool_input': {'page': 1}}, None, None)
-    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
-    denied = await s.authorize({'tool_name': 'mcp__workflow__submit_review', 'agent_type': 'answer-reviewer',
-                                'agent_id': 'reviewer', 'tool_input': {}}, None, None)
-    assert denied['hookSpecificOutput']['permissionDecision'] == 'deny'
 
 
 def test_unreadable_key_is_retained_without_inventing_answer(tmp_path, monkeypatch):

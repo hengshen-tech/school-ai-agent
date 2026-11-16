@@ -1,5 +1,6 @@
 """Validate actual OCR answer fragments and repair saved annotations without model calls."""
 import json
+import math
 import re
 import threading
 import unicodedata
@@ -63,6 +64,56 @@ def _missing_note(question, page):
     if question.get('answer_state') == 'blank':
         return '本题未作答，没有可标记的学生答案文字块'
     return f'OCR 已识别 {count} 个文字块，尚未匹配到本题学生答案；位置待确认'
+
+
+def pending_positions(grades):
+    return [q for q in grades or [] if not (q.get('bbox_ok') and q.get('bbox_px'))
+            and not (q.get('position_source') != 'vision' and q.get('answer_state') == 'blank' and not str(q.get('student_answer', '')).strip()
+                     and q.get('grade_confidence', 0) >= .7)]
+
+
+def apply_visual_fallback(questions, pages, direct=False):
+    """Use the same agent's visual box only when OCR supplied no valid position."""
+    sizes = {}
+    for question in questions:
+        if question.get('bbox_ok') and question.get('bbox_px'):
+            continue
+        if direct:
+            if question.get('answer_state') not in ('answered', 'blank', 'unreadable'):
+                continue
+        elif question.get('answer_state') != 'answered' or not str(question.get('student_answer', '')).strip():
+            continue
+        confidence = question.get('position_confidence')
+        if type(confidence) not in (int, float) or not math.isfinite(confidence) or not .9 <= confidence <= 1:
+            continue
+        box = ocr.valid_box(question.get('answer_bbox'))
+        if not box or (box[2] - box[0]) * (box[3] - box[1]) > (800000 if direct else 250000):
+            continue
+        page = question.get('page')
+        if type(page) is not int or not 1 <= page <= len(pages):
+            continue
+        # A visual guess cannot reuse the confirmed answer area of another question.
+        conflict = False
+        for other in questions:
+            if other is question or other.get('page') != page or not other.get('bbox_ok'):
+                continue
+            old = ocr.valid_box(other.get('bbox_norm'))
+            if old:
+                intersection = max(0, min(box[2], old[2]) - max(box[0], old[0])) * max(
+                    0, min(box[3], old[3]) - max(box[1], old[1]))
+                if intersection > .5 * min((box[2] - box[0]) * (box[3] - box[1]),
+                                            (old[2] - old[0]) * (old[3] - old[1])):
+                    conflict = True
+                    break
+        if conflict:
+            continue
+        if page not in sizes:
+            with Image.open(pages[page - 1]) as image:
+                sizes[page] = image.size
+        question.update(bbox_norm=box, bbox_px=imaging.norm_to_px(box, *sizes[page]), bbox_ok=True,
+            position_source='vision' if direct else 'vision_fallback', annotation_anchor='answer', ocr_block_ids=[],
+            draw=question.get('status') in (('correct', 'wrong', 'partial', 'review') if direct else ('correct', 'wrong', 'partial')),
+            position_note='')
 
 
 def apply_positions(questions, ocr_pages, pages, rows):

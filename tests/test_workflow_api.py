@@ -35,14 +35,13 @@ def test_prepare_job_preserves_mode_and_has_no_student_archive(monkeypatch):
         assert upload(client, mode="prepare", student_id="someone").status_code == 400
 
 
-def test_new_grading_requires_ocr_and_rejects_vision(monkeypatch):
+def test_new_grading_uses_vision_and_accepts_legacy_mode_without_ocr(monkeypatch):
     idle_manager(monkeypatch)
+    cfg = {**config.load_settings(), "base_url": "https://example.com/anthropic"}
+    monkeypatch.setattr(config, "load_settings", lambda: cfg)
     with TestClient(main.app) as client:
-        assert upload(client, ocr_mode="vision").status_code == 400
-        cfg = {**config.load_settings(), "base_url": "https://example.com/anthropic"}
-        monkeypatch.setattr(config, "load_settings", lambda: cfg)
-        assert upload(client).status_code == 400
-        # Preparing a paper does not run OCR, but still needs model credentials.
+        assert upload(client, ocr_mode="vision").status_code == 200
+        assert upload(client, ocr_mode="deepseek_ocr", force="true").status_code == 200
         assert upload(client, mode="prepare").status_code == 200
 
 
@@ -228,21 +227,14 @@ def test_prepare_then_answer_card_uses_reviewed_paper_and_file_cache(monkeypatch
         selected = state.paper
         question = {"id": "1", "type": "calc", "question": "12+8=",
                     "source_pages": [] if selected else [1], "reference_pages": [1] if selected else []}
-        state.submit_source({"title": "Quiz", "materials": [{"page": 1, "role": "question_paper" if state.mode == "prepare" else "student_work"}],
-                             "questions": [question]})
-        if not state.review:
-            state.submit_draft({"answers": [{"id": "1", "answer": "20", "confident": True}]})
-            state.submit_review({"source_version": state.source_version, "draft_version": state.draft_version,
-                                 "reviews": [{"id": "1", "status": "approved", "independent_answer": "20"}]})
-        if state.mode == "grade":
-            state.submit_grades({"source_version": state.source_version, "draft_version": state.draft_version,
-                                 "results": [{"id": "1", "page": 1, "answer_state": "answered", "student_answer": "20",
-                                              "verdict": "correct", "confidence": grade_confidence, "reason": "与已审核答案一致"}]})
-            await state.ocr_page({"page": 1})
-            state.submit_positions({"positions": [{"id": "1", "page": 1, "block_ids": ["p1:b1"]}]})
+        return {'title': 'Quiz', 'materials': [{'page':1, 'role': 'question_paper' if state.mode == 'prepare' else 'student_work', 'confidence': .99}], 'questions': [] if selected else [question],
+            'answers': [] if selected else [{'id': '1', 'answer': '20', 'confident': True}],
+            'results': [] if state.mode == 'prepare' else [{'id': '1', 'page': 1,
+                'answer_state': 'answered', 'student_answer': '20', 'verdict': 'correct',
+                'confidence': grade_confidence, 'answer_bbox': [300,300,400,340], 'position_confidence': .99}]}
     async def recognize(*args, **kwargs):
         return {"pages": [{"finish_reason": "stop", "text": "<|ref|>text<|/ref|><|box|>[[300,300,400,340]]<|/box|>20"}]}
-    monkeypatch.setattr(workflow, "run_workflow_agent", agent)
+    monkeypatch.setattr(workflow, "run_single_agent", agent)
     monkeypatch.setattr(ocr, "recognize", recognize)
     monkeypatch.setattr(main, "job_manager", JobManager(workflow.run_workflow))
     def finish(client, sid):
@@ -259,7 +251,7 @@ def test_prepare_then_answer_card_uses_reviewed_paper_and_file_cache(monkeypatch
         original_rev = store.get_paper(pid)["rev"]
         graded = finish(client, upload(client, paper_id=pid, file_roles='["student_work"]').json()["id"])
         if grade_confidence < .7:
-            assert graded["questions"][0]["status"] == "review" and not graded["questions"][0]["draw"]
+            assert graded["questions"][0]["status"] == "review" and graded["questions"][0]["draw"]  # yellow question mark
             graded = client.post(f"/api/submissions/{graded['id']}/override", json={"qid": "1", "status": "correct"}).json()
         assert graded["questions"][0]["draw"] and graded["summary"]["correct"] == 1
         assert graded["paper_cache_hit"] is True

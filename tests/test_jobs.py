@@ -310,3 +310,20 @@ def test_regrade_preserves_current_manual_student_assignment(monkeypatch):
         assert response.status_code == 200
         new = manager.record(response.json()["id"])
         assert new["meta"]["class_id"] == "B" and new["meta"]["student_id"] == "studentB"
+
+
+def test_stage_timings_keep_first_start_and_accumulate_retries(monkeypatch):
+    from app import jobs
+    manager = jobs.JobManager(None)
+    sid = 'sub_timing'
+    store.sub_dir(sid).mkdir()
+    manager.records[sid] = {'id': sid, 'stages': {}, 'timings': {}}
+    now = iter([100, 110, 120, 150, 155])
+    monkeypatch.setattr(jobs.time, 'time', lambda: next(now))
+    manager.emit(sid, 'parse', 'start')
+    manager.emit(sid, 'parse', 'start')
+    manager.emit(sid, 'parse', 'done')
+    assert manager.records[sid]['timings']['parse'] == 20
+    manager.emit(sid, 'parse', 'start')
+    manager.emit(sid, 'parse', 'done')
+    assert manager.records[sid]['timings']['parse'] == 25

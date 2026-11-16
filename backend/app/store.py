@@ -154,7 +154,8 @@ def workflow_file_key(file_hash, *, mode="grade", paper_id="", class_id="", task
     """Separate new results from legacy caches and pin an explicitly selected key."""
     paper = get_paper(paper_id) if paper_id else None
     revision = paper_rev if paper_rev is not None else paper.get("rev", 0) if paper else None
-    context = {"workflow_version": 2, "ocr_stage": "input-v1", "file_hash": file_hash, "mode": mode,
+    context = {"workflow_version": 2, "input_mode": "images-only", "execution_mode": "vision_agent",
+               "result_contract": "exam-grading-vision-v1", "file_hash": file_hash, "mode": mode,
                "paper_id": paper_id or "", "paper_rev": revision,
                "class_id": class_id or "", "task_id": task_id or "", "student_id": student_id or ""}
     return "workflow:2:" + sha256_bytes(json.dumps(context, sort_keys=True).encode())
@@ -254,7 +255,7 @@ def render_markdown(title: str, questions: list[dict], answers: list[dict]) -> s
     lines = [f"# {title or '未命名试卷'}", ""]
     for q in questions:
         a = amap.get(q["id"], {})
-        lines += [f"## 第 {q['id']} 题" + (f"　〔{a['knowledge']}〕" if a.get("knowledge") else ""), "",
+        lines += [f"## 第 {q.get('question_label') or q['id']} 题" + (f"　〔{a['knowledge']}〕" if a.get("knowledge") else ""), "",
                   q.get("question", ""), "",
                   f"**标准答案：** {a.get('answer', '（缺失）')}", ""]
         if a.get("explanation"):
@@ -309,7 +310,7 @@ def save_reviewed_paper(title, questions, answers, source, pid=None, reference_p
         meta["reference_pages"] = references
     meta.update(workflow_version=2, reviewed_rev=meta["rev"], review_summary={
         status: sum(a.get("review_status") == status for a in answers)
-        for status in ("approved", "review", "manual_confirmed")})
+        for status in ("approved", "review", "manual_confirmed", "ai_solved")})
     _write(folder / "paper.json", meta)
     return pid
 
@@ -345,7 +346,7 @@ def update_answers(pid: str, patch: list[dict]):
         save_paper(p["title"], p["questions"], answers, "teacher" if answer_changed else p.get("answer_source", "ai"), pid)
         meta = _read(PAPERS_DIR / pid / "paper.json")
         meta["review_summary"] = {status: sum(a.get("review_status") == status for a in answers)
-                                  for status in ("approved", "review", "manual_confirmed")}
+                                  for status in ("approved", "review", "manual_confirmed", "ai_solved")}
         _write(PAPERS_DIR / pid / "paper.json", meta)
     return get_paper(pid)
 

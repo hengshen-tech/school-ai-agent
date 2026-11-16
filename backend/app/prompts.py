@@ -1,4 +1,4 @@
-"""主工作流、原生子 Agent 和历史流程的提示词。"""
+"""单 Agent 批改任务、输入分类和历史兼容提示词。"""
 
 JSON_RULE = "只输出一个 JSON 对象，不要输出任何解释、前后缀或 Markdown 代码块标记。"
 
@@ -145,39 +145,48 @@ practice 给出 3 道针对薄弱知识点的同类练习题（错一练三）�
   "practice": [{{"knowledge": "知识点", "question": "题目", "answer": "答案"}}]}}
 {JSON_RULE}"""
 
-# Native Agent workflow. These tools carry structured proposals, never filesystem paths.
-WORKFLOW_SCHEMA = """
-所有 submit_* 与 ocr_page 工具参数都为 {"data": {...}}；get_state 无参数；read_page 参数 {"page": 全局页码} 或 {"reference": 试卷库参考页索引}。
-get_state 含全部 manifest、预处理完成的 ocr_pages、用户 teacher_key、selected_paper、版本及中间结果。OCR 已在 Agent 启动前执行，全部 Agent 共享这份结果；read_page 同时返回本页原图和 OCR 文字块。图片不继承给子代理，每个子代理必须自己调用 read_page。OCR 可能漏字、错字，必须结合原图，不能因 OCR 没识出而判空白。pN:bM 仅属于本次上传第 N 页；rN:bM 属于试卷库参考页，不能用于学生作答定位。
-submit_source data: {title,student_name,student_no,multiple_students,materials:[{page,role,confidence}],questions:[{id,type,question,source_pages:[全局页码],reference_pages:[参考页索引]}],reference_answers:[{id,answer,accepted,confident}]}。
-role: question_paper / answer_key / student_work，用户 requested_role 优先。题目必须是完整印刷题干与选项，子题拆分且题号唯一；题号必须完整覆盖所有题，不能只提取已作答题。只有题号的答题卡必须用 selected_paper 完整题目和参考页，保留 source_pages 或使用 reference_pages。不要把学生答案作为标准答案。
-submit_draft data: {answers:[{id,answer,accepted,explanation,knowledge,confident}]}，覆盖全部题。先独立解题，再对齐老师答案；老师答案原文保留在 teacher_answer，独立结果在 ai_answer。有冲突不能默默覆盖。模型绝不设置 edited/manual_confirmed。
-submit_review data: {source_version,draft_version,reviews:[{id,status:'approved'|'review',independent_answer,reason}]}，由 answer-reviewer 原生子代理独占。逐题独立验算、读取题干来源图及老师标准答案图。老师答案冲突、缺题、无法辨认或无把握必须 review；不能伪造人工确认。版本来自最新 get_state。
-submit_grades data: {source_version,draft_version,results:[{id,page,student_answer,answer_state,verdict,reason,confidence,key_doubt,error_type,answer_block_ids:["p2:b3"]}]}，由 student-grader 原生子代理独占。覆盖全部题。answer_state: answered / blank / unreadable / unaligned；verdict: correct / wrong / partial / null。page 只可为学生页。结合共享 OCR 和原图抄录学生作答，并同时选择对应最终答案文字块 answer_block_ids；多块可以组合，OCR 缺失或读错就 []，不猜坐标。只在清晰确认完全未作答时 blank；无法辨认/无法对齐/标准答案争议转人工复核。每题给理由、置信度。OCR 文字是辅助，判分以原图实际作答为准。
-ocr_page data: {page}，读取已预处理的本页 OCR 缓存（支持所有上传页），返回文字块编号如 p2:b3；无需在解题或批改后重新识别。同页重复读取不会重新请求 OCR。
-submit_positions data: {positions:[{id,page,block_ids:["p2:b3"]}]}。主代理看学生原图选学生最终答案本身的文字块；同块不能用于多题，必须同页，不选题号、题干、整行混合块或相邻题。学生答案记录可以包含全部算式和过程，OCR 块可以只含最终答案（如整段“465-278=187（竖式…）”对应“187”，或“96+498+132=594+132=726”对应“=726”）；不需要两段文字完全相同。LaTeX 包装和间隔不影响定位，数字、小数点、负号不同则不能当成相同答案。每题独立校验，返回 positioned 为已定位题数（包含待复核题）、drawn 为已落笔题数、rejected 为被拒题号和原因、unpositioned 为未定位题号。有效题保留，后续只补交未定位的题；空数组不会清掉已成功位置，明确清除某题用该题 block_ids=[]。OCR 漏识别或内容不符时保留未定位，不允许任何自估坐标或题干回退。review 题也必须提交能确认的 OCR 坐标，暂不落笔，人工改判后使用已保存位置绘制。
+MATERIAL_CLASSIFIER = """你负责识别上传材料的用途，只看当前页原图，不做 OCR 转录、解题或批改。
+严格只输出 JSON：{"role":"student_work","confidence":0.95}。
+role 只能是 question_paper（空白原题试卷）、answer_key（标准答案或解析）、student_work（学生答卷、答题卡或含学生作答的试卷）。
+题干和学生作答在同一页也属于 student_work。不要因为存在印刷题干而漏掉学生手写答案。
+标准答案、教师解析不属于学生作答，不能只因出现答案就判为学生卷。学生未作答的答题卡也可能属于 student_work。
+无法确定时 confidence 低于 0.7；不要猜测学生身份或凭空转录内容。
 """
 
-WORKFLOW_MAIN = """角色：主控工作流 Agent（workflow-v2-main）。
-你在一个持续会话中负责整组材料。后端已先执行 OCR。先 get_state 读取共享文字块与坐标，再结合所有 manifest 页图提交材料用途与完整题目。拒绝多学生合并。
-mode=prepare 只准备试卷，不能包含学生页；使用预处理 OCR，不执行学生批改和标注。mode=grade 批改一位学生。
-选定试卷库时读取它的全部题目及 archived reference_pages，支持只有答题卡。新老师答案优先送复核；旧缓存只能复用已 reviewed 或老师人工确认版本，不能信任普通 AI 缓存。
-get_state 的 prefer_saved_answers=true 表示老师要求按试卷库当前版本重新批改；此时已人工确认的库内答案优先于原上传的旧答案文件，不得用旧文件覆盖。存在新标准答案图片时必须提取 reference_answers；无法辨认的项保留题号、answer为空且 confident=false，不能假设没有老师答案而跳过审核。
-若 get_state 已有当前 review（缓存或重试恢复），跳过草案和复核；不得重做覆盖已复核答案。否则提交草案后，必须用真正的 Agent 工具 subagent_type='answer-reviewer' 启动专职复核员，要求自己 read_page 并 submit_review。等待子 Agent 通过工具提交完毕再继续；每次 Agent 返回后 get_state 确认复核或批改产物，不提前结束会话。不得用文字扮演子代理，不能自己提交复核或批改。
-有 AI 错误可最多修改一次并再调用同一复核子代理；老师冲突或仍不确定则保留 review。每次改题或改答案都要重做复核与下游阶段。
-复核提交完成才能用 Agent 工具 subagent_type='student-grader'；提醒它自己读取全部学生图及完整题目，提交全部题目结果。
-批改子代理必须结合现有 OCR 和原图提交每题 answer_block_ids。grade 模式最后检查已保存位置，只对未定位题补交 submit_positions；已有成功位置不清空，无法定位的题保留原因。prepare 模式复核后结束。
-不要以最终自然语言声称完成代替工具提交，后端检查阶段版本与产物。不要调用其他内置工具。
-""" + WORKFLOW_SCHEMA
+# User-supplied exam-grading instructions, followed by the application's I/O contract.
+from pathlib import Path
 
-ANSWER_REVIEW_AGENT = """角色：原生标准答案复核子代理（workflow-v2-answer-reviewer）。
-get_state 后读取共享 OCR，自己 read_page 全部题干来源页、参考页和标准答案页；不继承主代理图片。结合文字和原图独立验算全题，核对 teacher_key 与 reference_answers，不照抄草案的 confident。
-独立答案必须填在 independent_answer，不能只写已核对。以老师来源为参考，AI 与老师不一致、老师材料互相冲突、答案缺项或题意不明确一律 review 并说明。通过的 approved。独立答案和草稿的主观表述不同但评分要点完全等价时，另加 equivalent_to_draft=true；数字结果不等不能声称等价。缺少独立答案不能通过。
-只能由你调用 submit_review，完整覆盖题目，严格绑定最新 source_version/draft_version。不要调用批改或修改工具。
-""" + WORKFLOW_SCHEMA
+EXAM_GRADING_PROMPT = Path(__file__).with_name('exam_grading_prompt.md').read_text(encoding='utf-8')
+SINGLE_SUBMISSION = EXAM_GRADING_PROMPT + """
 
-STUDENT_GRADER_AGENT = """角色：原生学生批改子代理（workflow-v2-student-grader）。
-get_state 并自己 read_page 所有学生页及所需题目参考页；不得依赖主代理对子图的描述或继承图片。
-依据当前已复核标准答案，把完整题目和学生最终作答对齐，结合已有 OCR 与原图完成全题判分，调用 submit_grades，并为每题提供 answer_block_ids 对应实际学生答案（可只选最终结果，不必匹配整段过程）。只有确认未作答才 blank，模糊、未对齐、答案争议不得判为确定错误。标准答案 review 的题保留待人工，能定位的块仍须保存。
-严禁重新请求 OCR、改标准答案或提交审核。使用共享 OCR 的真实块编号，不输出自估坐标。
-""" + WORKFLOW_SCHEMA
+# 本系统集成要求
+你是本任务唯一的 Agent。自主完成上面的理解、多尺度看图、识别、独立解题、判分与复核，不创建子代理、不使用 MCP，也不等待后端逐阶段调用。系统不使用任何 OCR 服务，所有识别与定位以原图为准。
+
+## 可用的图像与核算工具
+输入消息包含全页预览及 image_paths（上传原图）、reference_image_paths（存档图）。先看全页；凡模糊、密集或有歧义的区域，应自主裁剪到题目/细节尺度，并用 Read 打开裁图片；再返回原图核对。不要只声称已放大却没有实际读取图片。
+Read: file_path 填本任务原图或裁图片的绝对路径。
+Bash 仅可使用输入 visual_command_prefix 后接以下命令，不执行其他系统命令：
+- crop --page 2 --bbox 100 200 500 600 --scale 2
+- crop --reference 1 --bbox 100 200 500 600 --scale 2
+- calc --expression '1/2+1/4'
+裁图返回 path、原图尺寸、原图框 original_bbox / original_pixels 及映射关系；必须再 Read 返回的 path 才能查看裁图。可以调整区域、重复裁图和缩放，不把局部坐标当整页坐标。工具只辅助你自己的判断，不代替看图复核。
+
+## 题目、老师材料和答案
+materials 的 requested_role 以老师指定为准，auto 页由你根据原图识别为 question_paper / answer_key / student_work，输出 materials 覆盖全部上传页；不能混合多位学生。
+根据原题独立解题，不用学生答案反推标准答案；复核由你在同一会话内完成。老师图片答案提取到 reference_answers，老师文字答案对应到 answers.teacher_answer。老师答案与独立结果有分歧或缺失时 confident=false 或 key_doubt=true，保留差异，不偷偷覆盖。prefer_saved_answers=true 时采用库中老师当前版本，忽略上传的旧答案。已有库内答案可作为参考但必须核对题意，不盲信历史 AI 解答。
+题号保留原卷大题/小题层级，如 1.1、1.2、2.1、2.2 或原卷明确的 17(1)、17(2)，不要把全卷重新连续编号。新试卷 questions.id、answers.id、results.id 一致；question_label 是卷面显示题号。selected_paper 已选择时沿用内部 ID 和完整题目，questions 可省略；旧库为连续内部 ID 时仍根据原图返回 results.question_label，不改内部 ID 导致答案串题。
+
+## 定位与标注
+每题返回 answer_bbox=[x1,y1,x2,y2]，坐标归一化到对应上传原图的 0–1000，page 使用上传材料的全局页码，不能使用裁图片或存档页的页码。position_confidence 是定位置信度，与判分置信度独立。必须紧贴本题学生答案，明确空白可框本题应答区；文字无法辨认但区域可确定时允许定位并标黄问号。无法对齐或无法确定位置时 bbox=null，不编造位置。
+后端负责用 Pillow 按你给的位置绘制红勾、红叉、黄问号，并用 ReportLab 导出按原页顺序的学生答卷 PDF。你不用自行绘图或写 PDF 文件；保持原图坐标映射，不遮挡答案、图示或其他重要内容。
+
+## 本系统请求的输出格式
+最终只输出下面的一个 JSON 对象（覆盖上文的默认简化数组格式），不输出计划或长篇推演。保留简短评分要点；正确题无需重复解释，错误与不确定题给必要理由。mode=prepare 仅准备题目和答案，results=[]；mode=grade 完整覆盖全部题目。
+{"title":"试卷名","student_name":"","student_no":"","multiple_students":false,
+ "materials":[{"page":1,"role":"question_paper","confidence":0.99},{"page":2,"role":"student_work","confidence":0.99}],
+ "questions":[{"id":"1.1","question_label":"1.1","type":"calc","question":"完整印刷题干含选项","source_pages":[1]}],
+ "reference_answers":[],
+ "answers":[{"id":"1.1","answer":"独立解题结果","accepted":[],"explanation":"简短评分要点","knowledge":"知识点","confident":true}],
+ "results":[{"id":"1.1","question_label":"1.1","page":2,"student_answer":"学生原始作答","answer_state":"answered","verdict":"correct","confidence":0.99,"key_doubt":false,"answer_bbox":[300,300,400,350],"position_confidence":0.95}]}
+type: choice/blank/calc/judge/subjective；answer_state: answered/blank/unreadable/unaligned；verdict: correct/wrong/partial/null。看不清、对不齐或标准答案有争议时 verdict=null，reason 说明疑问；位置确定则仍给 bbox 用于黄问号。没有老师图片时 reference_answers=[]，没有老师文字答案时不编造 teacher_answer。主观答案评分要点等价时可 teacher_equivalent=true，数值不同不能声称等价。有明确分值/评分规则时可返回每题 score、max_score 及 total_score、max_score；没有评分规则不得编造分值。
+"""

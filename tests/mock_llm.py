@@ -31,8 +31,10 @@ def bbox(i):  # 与 make_sample 的版式对应，0–1000 归一化
 
 def reply_for(body):
     dump = json.dumps(body.get("system", ""), ensure_ascii=False)
-    if "workflow-v2-" in dump:
-        return workflow_reply(body, dump)
+    if "你负责识别上传材料的用途" in dump:
+        return {"text": json.dumps({"role": "student_work", "confidence": .99})}
+    if "你是一位负责整份作业的批改老师" in dump:
+        return single_submission_reply(body)
     msgs = body.get("messages", [])
     imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "image")
     tool_imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"]
@@ -182,52 +184,38 @@ def log():
     return LOG
 
 
-# Deterministic native Agent fixture: works through actual SDK MCP + Agent calls.
-def workflow_reply(body, system):
-    messages = body.get("messages", [])
-    calls = [b for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), list)
-             for b in m["content"] if b.get("type") == "tool_use"]
-    results = {b["tool_use_id"]: b for m in messages if isinstance(m.get("content"), list)
-               for b in m["content"] if b.get("type") == "tool_result"}
-    names = [t["name"] for t in body.get("tools", [])]
-    available = lambda n: next((name for name in names if name.endswith(n)), n)
-    done = lambda n: [c for c in calls if c["name"].endswith(n) and c["id"] in results and not results[c["id"]].get("is_error")]
-    image_count = sum(1 for r in results.values() for b in (r.get("content", []) if isinstance(r.get("content"), list) else []) if b.get("type") == "image")
-    role = "answer-reviewer" if "workflow-v2-answer-reviewer" in system else "student-grader" if "workflow-v2-student-grader" in system else "main"
-    LOG.append({"role": role, "tool_result_images": image_count, "images": sum(1 for m in messages if isinstance(m.get("content"), list) for b in m["content"] if b.get("type") == "image"), "tools": names, "last_calls": calls[-2:], "last_result": str(list(results.values())[-1:])[:1800]})
-    def invoke(name, args): return {"tool": (available(name), args)}
-    if not done("get_state"): return invoke("get_state", {})
-    raw = results[done("get_state")[-1]["id"]].get("content", [])
-    text = raw if isinstance(raw, str) else "\n".join(b.get("text", "") for b in raw)
-    # SDK may wrap MCP's text content within a serialized content envelope.
-    try: state = json.loads(text)
-    except ValueError: state = {}
-    if "content" in state:
-        state = json.loads(state["content"][0]["text"])
-    LOG[-1]['shared_ocr_blocks'] = sum(len(p.get('blocks', [])) for p in state.get('ocr_pages', {}).values())
-    manifest = state.get("manifest", [{"page": 1, "requested_role": "student_work"}])
-    read = [c["input"].get("page") for c in done("read_page")]
-    needed = [m["page"] for m in manifest]
-    for page in needed:
-        if page not in read: return invoke("read_page", {"page": page})
-    if role == "answer-reviewer":
-        if not done("submit_review"):
-            return invoke("submit_review", {"data": {"source_version": state["source_version"], "draft_version": state["draft_version"], "reviews": [{"id": "1", "status": "approved", "independent_answer": "2", "reason": "Independent 1+1=2"}]}})
-        return {"text": "Review submitted."}
-    if role == "student-grader":
-        if not done("submit_grades"):
-            page = next(m["page"] for m in state["source"]["materials"] if m["role"] == "student_work")
-            blocks = state.get('ocr_pages', {}).get(str(page), {}).get('blocks', [])
-            selected = [b['id'] for b in blocks if b.get('text', '').strip() == '2']
-            return invoke("submit_grades", {"data": {"source_version": state["source_version"], "draft_version": state["draft_version"], "results": [{"id": "1", "page": page, "student_answer": "2", "answer_state": "answered", "verdict": "correct", "reason": "equal", "confidence": .99, "answer_block_ids": selected}]}})
-        return {"text": "Grades submitted."}
-    if not done("submit_source"):
-        roles = [{"page": m["page"], "role": m.get("requested_role") if m.get("requested_role") != "auto" else "student_work", "confidence": .99} for m in manifest]
-        return invoke("submit_source", {"data": {"title": "Synthetic", "materials": roles, "questions": [{"id": "1", "type": "calc", "question": "1+1=", "source_pages": [1]}]}})
-    if not done("submit_draft"): return invoke("submit_draft", {"data": {"answers": [{"id": "1", "answer": "2", "confident": True}]}})
-    agents = done("Agent") + done("Task")
-    if not agents: return invoke("Agent", {"description": "Review answer", "subagent_type": "answer-reviewer", "run_in_background": False, "prompt": "Read own source pages, independently review and submit_review now."})
-    if state.get("mode") == "prepare": return {"text": "Prepared."}
-    if len(agents) < 2: return invoke("Agent", {"description": "Grade student", "subagent_type": "student-grader", "run_in_background": False, "prompt": "Read own student pages and submit_grades for all questions now."})
-    if not done("submit_positions"): return invoke("submit_positions", {"data": {"positions": []}})
-    return {"text": "Completed."}
+# One-shot submission fixture; every image arrives directly in the user message.
+def single_submission_reply(body):
+    blocks = body['messages'][0]['content']
+    context = json.loads(blocks[0]['text'])
+    selected = context.get('selected_paper')
+    materials = context['materials']
+    work = next((m['page'] for m in materials if m['classified_role'] == 'student_work'), None)
+    source = next((m['page'] for m in materials if m['classified_role'] == 'question_paper'), work or 1)
+    name, student = PROFILES[STATE['n'] % len(PROFILES)]
+    STATE['n'] += 1
+    questions = [{'id': str(i), 'type': 'calc', 'question': q, 'source_pages': [source]}
+        for i, q in enumerate(('12+8=', '15-6=', '7*6=', '1/2+1/4=', '81/9='), 1)]
+    standard = {'1': '20', '2': '9', '3': '42', '4': '.75', '5': '9'}
+    if selected:
+        questions = selected['questions']
+        standard.update({a['id']: a['answer'] for a in selected.get('answers', [])})
+    recognized = {}
+    for block in blocks:
+        text = block.get('text', '')
+        if text.startswith(f'上传第 {work} 页；OCR'):
+            recognized = json.loads(text.split('\n', 1)[1])
+    results = []
+    if context['mode'] == 'grade':
+        for question in questions:
+            ident = question['id']; answer = student.get(ident, '')
+            ids = [b['id'] for b in recognized.get('blocks', []) if b.get('text', '').strip() == answer]
+            results.append({'id': ident, 'page': work, 'student_answer': answer,
+                'answer_state': 'answered' if answer else 'blank',
+                'verdict': 'correct' if store_norm(answer) == store_norm(standard[ident]) else 'wrong',
+                'confidence': .99, 'answer_block_ids': ids})
+    LOG.append({'role': 'single-agent', 'images': sum(b['type'] == 'image' for b in blocks), 'tools': len(body.get('tools', []))})
+    return {'text': json.dumps({'title': '模拟试卷', 'student_name': name, 'questions': [] if selected else questions,
+        'answers': [] if selected else [{'id': q['id'], 'answer': standard[q['id']], 'confident': True,
+                                        'knowledge': KP.get(q['id'], '')} for q in questions],
+        'results': results}, ensure_ascii=False)}
