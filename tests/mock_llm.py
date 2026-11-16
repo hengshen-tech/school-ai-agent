@@ -4,6 +4,7 @@
 用来验证「图片确实经由 Agent SDK 送到了模型接口」以及「工具调用往返」。
 """
 import json
+import os
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -30,6 +31,8 @@ def bbox(i):  # 与 make_sample 的版式对应，0–1000 归一化
 
 def reply_for(body):
     dump = json.dumps(body.get("system", ""), ensure_ascii=False)
+    if "workflow-v2-" in dump:
+        return workflow_reply(body, dump)
     msgs = body.get("messages", [])
     imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "image")
     tool_imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"]
@@ -126,7 +129,7 @@ async def messages(req: Request):
     msg = {"id": "msg_mock", "type": "message", "role": "assistant", "model": body.get("model"), "content": [],
            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 0}}
     if "tool" in r:
-        block = {"type": "tool_use", "id": "toolu_mock1", "name": r["tool"][0], "input": {}}
+        block = {"type": "tool_use", "id": f"toolu_mock{len(LOG)}", "name": r["tool"][0], "input": {}}
         delta = {"type": "input_json_delta", "partial_json": json.dumps(r["tool"][1])}
         stop = "tool_use"
     else:
@@ -165,6 +168,8 @@ async def ocr(req: Request):
             b = bbox(i)
             text += T(seen, [b[0] + 8, b[1] + 4, b[2] - 60, b[3] - 4])
     LOG.append({"role": "OCR", "purpose": purpose, "bytes": len(await form["file"].read())})
+    if os.environ.get('WORKFLOW_MOCK_SINGLE_QUESTION'):
+        text = T('2', [300, 300, 400, 350])
     if purpose == "text_recognition":
         text = "1. 20\n2. 9\n3. 42\n4. 3/4\n5. 9"
     return {"id": "ocr-mock", "object": "ocr.result", "created": 0, "purpose": purpose, "page_count": 1,
@@ -175,3 +180,54 @@ async def ocr(req: Request):
 @app.get("/log")
 def log():
     return LOG
+
+
+# Deterministic native Agent fixture: works through actual SDK MCP + Agent calls.
+def workflow_reply(body, system):
+    messages = body.get("messages", [])
+    calls = [b for m in messages if m.get("role") == "assistant" and isinstance(m.get("content"), list)
+             for b in m["content"] if b.get("type") == "tool_use"]
+    results = {b["tool_use_id"]: b for m in messages if isinstance(m.get("content"), list)
+               for b in m["content"] if b.get("type") == "tool_result"}
+    names = [t["name"] for t in body.get("tools", [])]
+    available = lambda n: next((name for name in names if name.endswith(n)), n)
+    done = lambda n: [c for c in calls if c["name"].endswith(n) and c["id"] in results and not results[c["id"]].get("is_error")]
+    image_count = sum(1 for r in results.values() for b in (r.get("content", []) if isinstance(r.get("content"), list) else []) if b.get("type") == "image")
+    role = "answer-reviewer" if "workflow-v2-answer-reviewer" in system else "student-grader" if "workflow-v2-student-grader" in system else "main"
+    LOG.append({"role": role, "tool_result_images": image_count, "images": sum(1 for m in messages if isinstance(m.get("content"), list) for b in m["content"] if b.get("type") == "image"), "tools": names, "last_calls": calls[-2:], "last_result": str(list(results.values())[-1:])[:1800]})
+    def invoke(name, args): return {"tool": (available(name), args)}
+    if not done("get_state"): return invoke("get_state", {})
+    raw = results[done("get_state")[-1]["id"]].get("content", [])
+    text = raw if isinstance(raw, str) else "\n".join(b.get("text", "") for b in raw)
+    # SDK may wrap MCP's text content within a serialized content envelope.
+    try: state = json.loads(text)
+    except ValueError: state = {}
+    if "content" in state:
+        state = json.loads(state["content"][0]["text"])
+    LOG[-1]['shared_ocr_blocks'] = sum(len(p.get('blocks', [])) for p in state.get('ocr_pages', {}).values())
+    manifest = state.get("manifest", [{"page": 1, "requested_role": "student_work"}])
+    read = [c["input"].get("page") for c in done("read_page")]
+    needed = [m["page"] for m in manifest]
+    for page in needed:
+        if page not in read: return invoke("read_page", {"page": page})
+    if role == "answer-reviewer":
+        if not done("submit_review"):
+            return invoke("submit_review", {"data": {"source_version": state["source_version"], "draft_version": state["draft_version"], "reviews": [{"id": "1", "status": "approved", "independent_answer": "2", "reason": "Independent 1+1=2"}]}})
+        return {"text": "Review submitted."}
+    if role == "student-grader":
+        if not done("submit_grades"):
+            page = next(m["page"] for m in state["source"]["materials"] if m["role"] == "student_work")
+            blocks = state.get('ocr_pages', {}).get(str(page), {}).get('blocks', [])
+            selected = [b['id'] for b in blocks if b.get('text', '').strip() == '2']
+            return invoke("submit_grades", {"data": {"source_version": state["source_version"], "draft_version": state["draft_version"], "results": [{"id": "1", "page": page, "student_answer": "2", "answer_state": "answered", "verdict": "correct", "reason": "equal", "confidence": .99, "answer_block_ids": selected}]}})
+        return {"text": "Grades submitted."}
+    if not done("submit_source"):
+        roles = [{"page": m["page"], "role": m.get("requested_role") if m.get("requested_role") != "auto" else "student_work", "confidence": .99} for m in manifest]
+        return invoke("submit_source", {"data": {"title": "Synthetic", "materials": roles, "questions": [{"id": "1", "type": "calc", "question": "1+1=", "source_pages": [1]}]}})
+    if not done("submit_draft"): return invoke("submit_draft", {"data": {"answers": [{"id": "1", "answer": "2", "confident": True}]}})
+    agents = done("Agent") + done("Task")
+    if not agents: return invoke("Agent", {"description": "Review answer", "subagent_type": "answer-reviewer", "run_in_background": False, "prompt": "Read own source pages, independently review and submit_review now."})
+    if state.get("mode") == "prepare": return {"text": "Prepared."}
+    if len(agents) < 2: return invoke("Agent", {"description": "Grade student", "subagent_type": "student-grader", "run_in_background": False, "prompt": "Read own student pages and submit_grades for all questions now."})
+    if not done("submit_positions"): return invoke("submit_positions", {"data": {"positions": []}})
+    return {"text": "Completed."}

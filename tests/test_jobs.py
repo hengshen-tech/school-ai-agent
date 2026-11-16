@@ -124,11 +124,11 @@ def test_submission_mode_and_interrupted_retry(monkeypatch):
     monkeypatch.setattr(main, "job_manager", manager)
     with TestClient(main.app) as client:
         r = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
-                        data={"ocr_mode": "vision", "answer_key": "1. 20"})
+                        data={"ocr_mode": "deepseek_ocr", "answer_key": "1. 20"})
         assert r.status_code == 200
         sid = r.json()["id"]
         status = client.get(f"/api/submissions/{sid}/status").json()
-        assert status["ocr_mode"] == "vision" and status["effort"] == "high"
+        assert status["ocr_mode"] == "deepseek_ocr" and status["effort"] == "high"
         assert client.post(f"/api/submissions/{sid}/retry").status_code == 409
     # Lifespan shutdown cancels owned jobs and marks them interrupted.
     with TestClient(main.app) as client:
@@ -136,7 +136,7 @@ def test_submission_mode_and_interrupted_retry(monkeypatch):
         r = client.post(f"/api/submissions/{sid}/retry")
         assert r.status_code == 200 and r.json()["id"] != sid
         new = manager.record(r.json()["id"])
-        assert new["teacher_key"] == "1. 20" and new["meta"]["ocr_mode"] == "vision"
+        assert new["teacher_key"] == "1. 20" and new["meta"]["ocr_mode"] == "deepseek_ocr"
 
 
 def test_sse_cursor_and_finished_history(monkeypatch):
@@ -168,7 +168,7 @@ def test_restart_preserves_cursor_after_unsnapshotted_output_and_partial_line():
     assert tail[0]["id"] > 2
 
 
-def test_full_pipeline_finishes_after_preview_and_can_reopen(monkeypatch):
+def test_legacy_pipeline_finishes_after_preview_and_can_reopen(monkeypatch):
     import time
     from app import pipeline, prompts
     from app.jobs import JobManager
@@ -183,11 +183,12 @@ def test_full_pipeline_finishes_after_preview_and_can_reopen(monkeypatch):
             return {"answers": [{"id": "1", "answer": "20", "confident": True}]}
         return {"reviews": [{"id": "1", "bbox_ok": True, "matches": True, "read_answer": "20"}]}
     monkeypatch.setattr(pipeline, "run_json_agent", model)
+    monkeypatch.setattr(pipeline.ocr, "enabled", lambda cfg: False)
     manager = JobManager(pipeline.run_pipeline)
     monkeypatch.setattr(main, "job_manager", manager)
     with TestClient(main.app) as client:
         sid = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
-                          data={"ocr_mode": "vision"}).json()["id"]
+                          data={"ocr_mode": "deepseek_ocr"}).json()["id"]
         for _ in range(100):
             if "release" in gate:
                 break
@@ -202,14 +203,15 @@ def test_full_pipeline_finishes_after_preview_and_can_reopen(monkeypatch):
             time.sleep(.01)
         result = client.get(f"/api/submissions/{sid}").json()
         assert result["summary"]["correct"] == 1 and result["effort"] == "high"
-        assert result["timings"]["review"] >= 0 and result["ocr_mode"] == "vision"
+        assert result["timings"]["review"] >= 0 and result["ocr_mode"] == "deepseek_ocr"
         assert client.get(f"/api/submissions/{sid}/pdf").content.startswith(b"%PDF")
         assert client.get(f"/api/submissions/{sid}/pages/1").status_code == 200
         assert client.get("/api/jobs").json() == []
         assert '"stage": "done"' in client.get(f"/api/submissions/{sid}/events").text
         cached = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
-                             data={"ocr_mode": "vision"}).json()
-        assert cached == {"id": sid, "cached": True}
+                             data={"ocr_mode": "deepseek_ocr"}).json()
+        # Legacy output remains readable but cannot bypass native answer review.
+        assert cached["cached"] is False and cached["id"] != sid
 
 
 @pytest.mark.asyncio
@@ -257,17 +259,17 @@ def test_same_file_uploaded_to_different_class_does_not_reuse_other_class(monkey
                        "students": [], "tasks": []})
     pid = store.save_paper("试卷", [{"id": "1", "question": "12 + 8 = ?"}], [{"id": "1", "answer": "20"}], "ai")
     sid, file_hash = "sub_classA", store.sha256_bytes(image_bytes())
-    store.save_result(sid, {"id": sid, "filename": "a.png", "class_id": "A", "ocr_mode": "vision",
+    cache_key = store.workflow_file_key(file_hash, class_id="A")
+    store.save_result(sid, {"id": sid, "filename": "a.png", "class_id": "A", "ocr_mode": "deepseek_ocr",
+                           "mode": "grade", "workflow_version": 2, "file_key": cache_key,
                            "paper_id": pid, "paper_rev": 0, "superseded": False})
-    # Existing installations have keys without class context. Never migrate a
-    # legacy hit unless its actual result belongs to the requested class.
-    store.index_key(store.file_key(file_hash, "", "", "vision"), sid)
+    store.index_key(cache_key, sid)
     with TestClient(main.app) as client:
         hit = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
-                          data={"class_id": "A", "ocr_mode": "vision"}).json()
+                          data={"class_id": "A", "ocr_mode": "deepseek_ocr"}).json()
         assert hit == {"id": sid, "cached": True}
         other = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
-                            data={"class_id": "B", "ocr_mode": "vision"}).json()
+                            data={"class_id": "B", "ocr_mode": "deepseek_ocr"}).json()
         assert other["cached"] is False and other["id"] != sid
         status = client.get(f"/api/submissions/{other['id']}/status").json()
         assert status["class_id"] == "B"

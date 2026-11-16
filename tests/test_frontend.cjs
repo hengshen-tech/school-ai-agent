@@ -20,6 +20,58 @@ function setup() {
   vm.runInContext(source,context);
   return {run:(s)=>vm.runInContext(s,context),el,sources,context};
 }
+test('new workflow stages distinguish answer review from OCR location',()=>{
+  const s=setup();
+  const stages=JSON.parse(s.run('JSON.stringify(STEPS.map(x=>x[0]))'));
+  assert.ok(stages.includes('answer_review'));
+  assert.ok(stages.includes('locate'));
+  assert.ok(stages.indexOf('answer_review')<stages.indexOf('grade'));
+  assert.ok(stages.indexOf('ocr')<stages.indexOf('parse'));
+});
+test('hook activity cannot downgrade a completed stage',()=>{
+  const s=setup();
+  s.run('stageState={grade:{status:"done",t:10}};applyJobEvent({id:9,stage:"grade",status:"info",kind:"hook",t:11,message:"main: get_state"})');
+  assert.equal(s.run('stageState.grade.status'),'done');
+});
+test('manual positioning switches to the student page and original image',()=>{
+  const s=setup();
+  s.run('cur={id:"sub_test",page_count:2,questions:[{id:"7",page:2,status:"correct"}]};beginManualPosition("7")');
+  assert.equal(s.run('page'),2);
+  assert.equal(s.run('kind'),'raw');
+  assert.match(s.el('#positionHint').textContent,/7/);
+  assert.equal(s.el('#manualPositionTools').hidden,false);
+  s.run('cancelManualPosition()');
+  assert.equal(s.el('#manualPositionTools').hidden,true);
+});
+test('preparation draft sends mode without student archive fields',async()=>{
+  const s=setup(), uploads=[];
+  s.context.fetch=async(url,opt={})=>{
+    if(opt.method==='POST') { uploads.push(opt.body); throw new Error('keep draft'); }
+    return {ok:true,json:async()=>[]};
+  };
+  s.run('uploadMode="prepare";stageFiles([{name:"paper.png",size:10}],"question_paper")');
+  s.el('#uStudent').value='stale-student';s.el('#uClass').value='stale-class';
+  await s.run('uploadFromHome()');
+  assert.equal(uploads[0].get('mode'),'prepare');
+  assert.equal(uploads[0].get('student_id'),null);
+  assert.equal(uploads[0].get('class_id'),null);
+});
+test('selected saved paper and preparation mode survive draft switching',()=>{
+  const s=setup();
+  s.run('uploadMode="prepare";selectedPaperId="paper_saved";stageFiles([{name:"one.png",size:10}]);saveUploadDraft();uploadMode="grade";selectedPaperId="";restoreUploadDraft(activeDraftId)');
+  assert.equal(s.run('uploadMode'),'prepare');
+  assert.equal(s.run('selectedPaperId'),'paper_saved');
+  assert.equal(s.el('#startUpload').textContent,'开始建库');
+});
+test('paper detail offers explicit confirmation and shows conflicting answers',async()=>{
+  const s=setup();
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'12+8='}],answers:[{id:'1',answer:'20',teacher_answer:'21',review_status:'review',review_reason:'冲突'}]};
+  s.context.fetch=async(url)=>({ok:true,json:async()=>url==='/api/papers'?[]:paper});
+  await s.run('openPaper("paper_test")');
+  assert.match(s.el('#paperDetail').innerHTML,/待人工确认/);
+  assert.match(s.el('#paperDetail').innerHTML,/21/);
+  assert.match(s.el('#paperDetail').innerHTML,/data-confirm/);
+});
 test('running job raw preview uses active job ID before result exists',()=>{
   const s=setup();s.run('cur = null; activeJob = {id:"running-a",page_count:2}; page=1; kind="raw"; drawPage()');
   assert.match(s.el('#pageImg').src,/running-a\/pages\/1\?kind=raw/);
@@ -234,11 +286,11 @@ test('materials can be removed and invalid file sets are rejected before uploadi
   s.run('stageFiles(Array.from({length:6},()=>({name:"x.pdf",size:40*1024*1024})))');assert.equal(s.run('stagedFiles.length'),1);
   assert.match(s.el('#uploadErr').textContent,/200/);
 });
-test('OCR defaults to DeepSeek when available and falls back to vision',()=>{
+test('new uploads always use OCR and never fall back to vision',()=>{
   const s=setup();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
   s.el('#uOcr').value='vision';s.el('#uOcr').onchange({target:s.el('#uOcr')});
-  s.run('syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'vision');
-  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'vision');
+  s.run('syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
+  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
 });
 test('task file selection moves to staged home with task context and no upload',async()=>{
   const s=taskHarness();await s.run('openTask("A")');
@@ -310,7 +362,7 @@ test('task material selection keeps the prior draft separate and restores all of
   s.run(`switchUploadDraft(${previous})`);
   assert.equal(s.run('stagedFiles[0].file.name'),'A.pdf');assert.equal(s.run('stagedFiles[0].role'),'student_work');
   assert.equal(s.el('#answerKey').value,'A标准答案');assert.equal(s.el('#uClass').value,'class');
-  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.el('#uOcr').value,'vision');
+  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
   await s.run('openTask("B")');s.el('#tFile').onchange({target:{files:[{name:'B-2.png',size:10}],value:'x'}});
   assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.run('stagedFiles[0].file.name'),'B.pdf');assert.equal(s.el('#answerKey').value,'');
 });
@@ -353,13 +405,13 @@ test('task import validates the saved destination draft limit without changing t
   assert.equal(s.run('[...uploadDrafts.values()].find(draft=>draft.task_id==="B").files.length'),20);
 });
 
-test('task OCR selection overrides the saved draft mode when adding more materials',async()=>{
+test('task uploads normalize historical vision drafts to OCR',async()=>{
   const s=taskHarness();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');
   await s.run('openTask("B")');
   s.el('#tFile').onchange({target:{files:[{name:'one.png',size:10}],value:'x'}});
   assert.equal(s.el('#uOcr').value,'deepseek_ocr');
   await s.run('openTask("B")');s.el('#tOcr').value='vision';s.el('#tOcr').onchange({target:s.el('#tOcr')});
   s.el('#tFile').onchange({target:{files:[{name:'two.png',size:10}],value:'x'}});
-  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.el('#uOcr').value,'vision');
-  assert.equal(s.run('uploadDrafts.get(activeDraftId).ocr_mode'),'vision');
+  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.el('#uOcr').value,'deepseek_ocr');
+  assert.equal(s.run('uploadDrafts.get(activeDraftId).ocr_mode'),'deepseek_ocr');
 });

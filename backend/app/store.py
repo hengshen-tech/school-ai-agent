@@ -8,16 +8,28 @@
 import hashlib
 import json
 import re
+import shutil
+import threading
 import time
 import unicodedata
 import uuid
 from difflib import SequenceMatcher
+from functools import wraps
 from pathlib import Path
 
 from .config import DATA_DIR, PAPER_MATCH_THRESHOLD, PAPERS_DIR, SUBS_DIR
 
 FILE_INDEX = DATA_DIR / "file_index.json"
+_STORE_LOCK = threading.RLock()
 _FULLWIDTH_ASCII = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
+
+
+def _serialized(fn):
+    @wraps(fn)
+    def locked(*args, **kwargs):
+        with _STORE_LOCK:
+            return fn(*args, **kwargs)
+    return locked
 
 
 def _read(p: Path, default=None):
@@ -27,6 +39,7 @@ def _read(p: Path, default=None):
         return default
 
 
+@_serialized
 def _write(p: Path, obj):
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -74,7 +87,9 @@ def norm_answer(s) -> str:
     """
     s = _width_normalize(s).lower()
     s = re.sub(r"\s+", "", s)
-    return s.strip("$。.,，;；:：、!！?？")
+    s = s.strip("$。,，;；:：、!！?？").rstrip(".")
+    # A leading decimal point changes the value: .5 is 1/2, never 5.
+    return s if re.match(r"^\.\d", s) else s.lstrip(".")
 
 
 def _nums(s) -> list[str]:
@@ -122,10 +137,46 @@ def file_key(file_hash: str, task_id="", student_id="", ocr_mode=None, class_id=
     return _fkey(file_hash, task_id, student_id, ocr_mode, class_id)
 
 
+@_serialized
 def index_key(key: str, sid: str):
     idx = _read(FILE_INDEX, {}) or {}
     idx[key] = sid
     _write(FILE_INDEX, idx)
+
+
+@_serialized
+def invalidate_result_cache(sid):
+    index = _read(FILE_INDEX, {}) or {}
+    _write(FILE_INDEX, {key: value for key, value in index.items() if value != sid})
+
+
+def workflow_file_key(file_hash, *, mode="grade", paper_id="", class_id="", task_id="", student_id="", paper_rev=None):
+    """Separate new results from legacy caches and pin an explicitly selected key."""
+    paper = get_paper(paper_id) if paper_id else None
+    revision = paper_rev if paper_rev is not None else paper.get("rev", 0) if paper else None
+    context = {"workflow_version": 2, "ocr_stage": "input-v1", "file_hash": file_hash, "mode": mode,
+               "paper_id": paper_id or "", "paper_rev": revision,
+               "class_id": class_id or "", "task_id": task_id or "", "student_id": student_id or ""}
+    return "workflow:2:" + sha256_bytes(json.dumps(context, sort_keys=True).encode())
+
+
+def find_workflow_result(key, *, mode="grade", paper_id="", class_id="", task_id="", student_id=""):
+    sid = (_read(FILE_INDEX, {}) or {}).get(key)
+    result = get_result(sid) if sid else None
+    if not result or result.get("superseded") or result.get("workflow_version") != 2:
+        return None
+    if result.get("mode", "grade") != mode or result.get("file_key") != key:
+        return None
+    if (result.get("class_id") or "") != class_id or (result.get("task_id") or "") != task_id:
+        return None
+    if student_id and result.get("student_id") != student_id:
+        return None
+    if paper_id and result.get("paper_id") != paper_id:
+        return None
+    paper = get_paper(result.get("paper_id", ""))
+    if paper and paper.get("rev", 0) == result.get("paper_rev", 0):
+        return sid
+    return None
 
 
 # ---------- 试卷库 ----------
@@ -143,10 +194,11 @@ def list_papers() -> list[dict]:
         meta = _read(d / "paper.json")
         if meta:
             out.append({k: meta.get(k) for k in ("id", "title", "created_at", "question_count", "used_count",
-                                                 "answer_source")})
+                                                 "answer_source", "rev", "workflow_version", "review_summary")})
     return sorted(out, key=lambda m: m["created_at"], reverse=True)
 
 
+@_serialized
 def get_paper(pid: str):
     d = PAPERS_DIR / pid
     meta = _read(d / "paper.json")
@@ -210,12 +262,15 @@ def render_markdown(title: str, questions: list[dict], answers: list[dict]) -> s
     return "\n".join(lines)
 
 
+@_serialized
 def save_paper(title, questions, answers, source: str, pid: str | None = None) -> str:
     pid = pid or new_id("paper")
     d = PAPERS_DIR / pid
-    qs = [{k: q.get(k) for k in ("id", "type", "question", "page")} for q in questions]
+    qs = [{k: q[k] for k in ("id", "type", "question", "page", "source_page", "source_pages", "reference_page", "reference_pages") if k in q}
+          for q in questions]
     old = _read(d / "paper.json", {}) or {}
     _write(d / "paper.json", {
+        **old,
         "id": pid, "title": title or "未命名试卷",
         "created_at": old.get("created_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
         "fingerprint": fingerprint(qs), "norm_text": paper_text(qs), "questions": qs,
@@ -226,6 +281,40 @@ def save_paper(title, questions, answers, source: str, pid: str | None = None) -
     return pid
 
 
+@_serialized
+def save_reviewed_paper(title, questions, answers, source, pid=None, reference_pages=None):
+    """Publish reviewed per-question keys and durable source images (including disputes)."""
+    sources = []
+    for number, item in enumerate(reference_pages or [], 1):
+        item = dict(item) if isinstance(item, dict) else {"page": number, "path": item}
+        page = item.get("page")
+        if type(page) is not int or page < 1 or any(r["page"] == page for r in sources):
+            raise ValueError("试卷原图页码无效或重复")
+        if not Path(item["path"]).is_file():
+            raise ValueError("试卷原图不存在")
+        sources.append(item)
+    pid = save_paper(title, questions, answers, source, pid)
+    folder = PAPERS_DIR / pid
+    meta = _read(folder / "paper.json")
+    references = []
+    for item in sources:
+        page = item["page"]
+        source_path = Path(item["path"])
+        target = folder / "reference-pages" / f"page-{page}.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source_path.resolve() != target.resolve():
+            shutil.copyfile(source_path, target)
+        references.append({**{k: v for k, v in item.items() if k != "path"}, "path": str(target)})
+    if reference_pages is not None:
+        meta["reference_pages"] = references
+    meta.update(workflow_version=2, reviewed_rev=meta["rev"], review_summary={
+        status: sum(a.get("review_status") == status for a in answers)
+        for status in ("approved", "review", "manual_confirmed")})
+    _write(folder / "paper.json", meta)
+    return pid
+
+
+@_serialized
 def update_answers(pid: str, patch: list[dict]):
     p = get_paper(pid)
     if not p:
@@ -240,8 +329,13 @@ def update_answers(pid: str, patch: list[dict]):
         a = amap.setdefault(qid, {"id": qid, "answer": "", "accepted": [], "explanation": "", "knowledge": ""})
         if "answer" in it and str(it["answer"]).strip() != str(a.get("answer", "")):
             # 只有真正被老师改过的题才标记为"已人工确认"，其余题保留 AI 的把握度提示
-            a["answer"], a["confident"], a["edited"] = str(it["answer"]).strip(), True, True
+            a["answer"] = str(it["answer"]).strip()
+            a["confident"] = a["edited"] = bool(a["answer"])
             a["accepted"] = []  # 等价答案属于旧答案，老师修改后不能继续据此判对。
+            a["review_status"] = "manual_confirmed" if a["answer"] else "review"
+            answer_changed = changed = True
+        if it.get("confirmed") is True and a.get("answer") and a.get("review_status") != "manual_confirmed":
+            a.update(review_status="manual_confirmed", edited=True, confident=True)
             answer_changed = changed = True
         if "knowledge" in it and str(it["knowledge"]).strip() != str(a.get("knowledge", "")):
             a["knowledge"] = str(it["knowledge"]).strip()
@@ -249,9 +343,14 @@ def update_answers(pid: str, patch: list[dict]):
     if changed:  # 没有实际改动就不保存，避免无谓地让文件缓存失效
         answers = [amap[q["id"]] for q in p["questions"] if q["id"] in amap]
         save_paper(p["title"], p["questions"], answers, "teacher" if answer_changed else p.get("answer_source", "ai"), pid)
+        meta = _read(PAPERS_DIR / pid / "paper.json")
+        meta["review_summary"] = {status: sum(a.get("review_status") == status for a in answers)
+                                  for status in ("approved", "review", "manual_confirmed")}
+        _write(PAPERS_DIR / pid / "paper.json", meta)
     return get_paper(pid)
 
 
+@_serialized
 def bump_paper(pid: str):
     f = PAPERS_DIR / pid / "paper.json"
     meta = _read(f)
@@ -307,7 +406,7 @@ def all_results() -> list[dict]:
     out = []
     for d in SUBS_DIR.iterdir():
         r = _read(d / "result.json")
-        if r and not r.get("superseded"):
+        if r and not r.get("superseded") and r.get("mode") != "prepare":
             out.append(r)
     return sorted(out, key=lambda r: (r["created_at"], r["id"]))
 

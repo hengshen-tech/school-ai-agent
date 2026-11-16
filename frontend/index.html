@@ -25,8 +25,8 @@
   <!-- 批改 -->
   <section id="view-work" class="view on">
     <div id="home">
-      <h1>今天批改哪一份？</h1>
-      <p class="lead">上传学生作答后的试卷，识别题目与答案、判分，再把对错号画回卷面。OCR 模式直接使用答案文字块坐标标注。</p>
+      <h1 id="uploadTitle">今天批改哪一份？</h1>
+      <p class="lead" id="uploadLead">添加试卷、可选参考答案和一位学生的作答。先审核标准答案，再批改，最后用 DeepSeek OCR 定位并标注。</p>
       <label id="drop" class="drop">
         <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden>
         <div class="drop-icon">＋</div>
@@ -36,10 +36,12 @@
       <div id="materialList" class="material-list" aria-label="待开始的批改材料"></div>
       <div class="upload-start"><span id="materialSummary" class="sub" role="status"></span><button type="button" class="primary" id="startUpload" disabled>开始批改</button></div>
       <div class="pick">
-        <label>识别方式<select id="uOcr"><option value="deepseek_ocr">DeepSeek OCR（默认）</option></select></label>
-        <label>班级<select id="uClass"></select></label>
-        <label>任务<select id="uTask"></select></label>
-        <label>学生<select id="uStudent"></select></label>
+        <label>处理方式<select id="uMode"><option value="grade">批改学生作答</option><option value="prepare">仅解题并存入试卷库</option></select></label>
+        <label id="uPaperWrap">使用已备试卷<select id="uPaper"><option value="">从本次材料识别试卷</option></select></label>
+        <input id="uOcr" type="hidden" value="deepseek_ocr">
+        <label id="uClassWrap">班级<select id="uClass"></select></label>
+        <label id="uTaskWrap">任务<select id="uTask"></select></label>
+        <label id="uStudentWrap">学生<select id="uStudent"></select></label>
       </div>
       <details class="keybox">
         <summary>我有标准答案（可选）</summary>
@@ -71,7 +73,8 @@
             <div class="seg"><button id="showAnn" class="on">批改后</button><button id="showRaw">原图</button></div>
           </div>
           <button id="retryPage" class="ghost" hidden>重新加载页面</button>
-          <div class="paper-img"><img id="pageImg" alt="试卷页面"><div id="paperWait" class="wait">正在处理…</div></div>
+          <div id="manualPositionTools" class="position-tools" hidden><span id="positionHint" role="status"></span><button id="cancelPosition" class="ghost">取消框选</button></div>
+          <div class="paper-img"><img id="pageImg" alt="试卷页面" draggable="false"><div id="positionBox" hidden></div><div id="paperWait" class="wait">正在处理…</div></div>
         </div>
         <div class="panel">
           <ol id="steps" class="steps"></ol>
@@ -133,7 +136,8 @@
   <!-- 试卷库 -->
   <section id="view-papers" class="view">
     <h1>试卷库</h1>
-    <p class="lead">每套试卷第一次批改时，题目和标准答案会保存在这里。之后再遇到同一套试卷，直接复用答案，不再重新解题。</p>
+    <p class="lead">可以先上传试卷解题建库，也可以在首次批改时建立。标准答案经独立审核后复用，有争议的题等待人工确认。</p>
+    <button class="primary" id="preparePaper">上传试卷建库</button>
     <div class="papers-wrap">
       <div id="paperList" class="list"></div>
       <div id="paperDetail" class="paper-detail" hidden></div>
@@ -151,9 +155,9 @@
         <small>填 Anthropic 兼容地址，结尾不要带 <code>/v1</code>。</small></label>
       <label>API Key<input id="sKey" type="password" autocomplete="off" placeholder="sk-…">
         <small id="keyHint">保存在服务端数据卷中，页面上不会回显。</small></label>
-      <label class="check"><input type="checkbox" id="sZoom"> 允许复核 Agent 自主调用"放大查看"工具
+      <label class="check" hidden><input type="checkbox" id="sZoom"> 历史视觉复核设置
         <small>仅视觉识别模式生效；接口不支持工具返回图片时会自动降级为普通复核。</small></label>
-      <label class="check"><input type="checkbox" id="sOcr"> 使用 DeepSeek OCR 辅助定位与交叉核对
+      <label class="check" hidden><input type="checkbox" id="sOcr"> 历史 OCR 设置
         <small id="ocrHint"></small></label>
       <div class="row"><button class="primary" type="submit">保存</button>
         <button class="ghost" type="button" id="testBtn">测试连接</button><span id="setMsg"></span></div>

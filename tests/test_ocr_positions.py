@@ -229,7 +229,8 @@ def test_ocr_upload_api_keeps_unlocated_grade_and_exports_pdf(monkeypatch):
         assert client.get(f"/api/submissions/{sid}/pdf").content.startswith(b"%PDF")
         cached = client.post("/api/submissions", files={"file": ("a.png", image_bytes(), "image/png")},
                              data={"ocr_mode": "deepseek_ocr"}).json()
-        assert cached == {"id": sid, "cached": True}
+        # Native workflow must not reuse an unaudited legacy pipeline result.
+        assert cached["cached"] is False and cached["id"] != sid
 
 
 def test_mock_model_selects_actual_ocr_blocks(monkeypatch):

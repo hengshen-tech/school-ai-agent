@@ -21,8 +21,8 @@ DEFAULTS = {
     "model": os.environ.get("LLM_MODEL", "deepseek-flash"),  # DeepSeek V4.1 Flash 的官方模型 ID
     "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/anthropic"),
     "api_key": os.environ.get("LLM_API_KEY", ""),
-    "agentic_zoom": True,  # 允许复核 Agent 自主调用放大工具
-    "use_ocr": True,       # 检测到 DeepSeek 接口时，用它的 OCR 接口做定位参考与交叉核对
+    "agentic_zoom": True,  # 历史视觉复核配置；新工作流通过受限 read_page 工具看图。
+    "use_ocr": True,       # 历史配置；新批改统一使用 OCR，单独建库不执行 OCR。
 }
 
 

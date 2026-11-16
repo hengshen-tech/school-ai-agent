@@ -48,6 +48,9 @@ class JobManager:
             out.write(json.dumps(event, ensure_ascii=False) + "\n")
         if "page_count" in extra:
             record["page_count"] = extra["page_count"]
+        for field in ("paper_id", "workflow_version", "mode"):
+            if field in extra:
+                record[field] = extra[field]
         if event["kind"] == "metric":
             record.setdefault("model_calls", []).append(extra["metric"])
         if event["kind"] == "status":
@@ -101,7 +104,9 @@ class JobManager:
                                   model_calls=record["model_calls"], effort="high",
                                   elapsed_s=round(record["finished_at"] - record["started_at"], 1))
                     store.save_result(sid, result)
-                emit("done", "done", "批改完成")
+                if result:
+                    record["paper_id"] = result.get("paper_id")
+                emit("done", "done", "建库完成" if record["meta"].get("mode") == "prepare" else "批改完成")
         except asyncio.CancelledError:
             record.update(status="interrupted", finished_at=time.time(), error="服务停止，批改已中断，可重试")
             emit("interrupted", "error", record["error"])
@@ -159,6 +164,8 @@ class JobManager:
                     "timings": result.get("timings", {}), "elapsed_s": result.get("elapsed_s", 0),
                     "ocr_mode": result.get("ocr_mode", "deepseek_ocr" if result.get("ocr_used") else "vision"),
                     "position_method": result.get("position_method"),
+                    "mode": result.get("mode", "grade"), "workflow_version": result.get("workflow_version", 1),
+                    "paper_id": result.get("paper_id"),
                     "last_event_id": 0, "task_id": result.get("task_id", "")}
         now = record.get("finished_at") or time.time()
         meta = record["meta"]
@@ -172,6 +179,8 @@ class JobManager:
                 "page_count": record.get("page_count", 0), "ocr_mode": meta.get("ocr_mode", "vision"),
                 "position_method": meta.get("position_method"),
                 "model": record.get("settings", {}).get("model", ""), "effort": "high",
+                "mode": meta.get("mode", "grade"), "workflow_version": meta.get("workflow_version", 1),
+                "paper_id": record.get("paper_id") or meta.get("paper_id"),
                 "timings": record.get("timings", {}), "stages": record.get("stages", {}),
                 "last_event_id": record.get("last_event_id", 0),
                 **{k: meta.get(k, "") for k in ("class_id", "task_id", "student_id")}}
