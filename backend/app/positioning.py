@@ -84,7 +84,7 @@ def apply_visual_fallback(questions, pages, direct=False):
         elif question.get('answer_state') != 'answered' or not str(question.get('student_answer', '')).strip():
             continue
         confidence = question.get('position_confidence')
-        if type(confidence) not in (int, float) or not math.isfinite(confidence) or not .9 <= confidence <= 1:
+        if type(confidence) not in (int, float) or not math.isfinite(confidence) or not .7 <= confidence <= 1:
             continue
         box = ocr.valid_box(question.get('answer_bbox'))
         if not box or (box[2] - box[0]) * (box[3] - box[1]) > (800000 if direct else 250000):

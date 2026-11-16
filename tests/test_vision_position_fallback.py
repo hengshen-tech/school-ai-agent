@@ -12,6 +12,16 @@ def grade_payload(**kwargs):
          'position_confidence': .96, **kwargs}]}
 
 
+@pytest.mark.parametrize('confidence,accepted', [(.699, False), (.7, True), (.85, True)])
+def test_vision_position_confidence_cutoff(tmp_path, monkeypatch, confidence, accepted):
+    s = state(tmp_path, monkeypatch); reviewed(s)
+    s.meta['execution_mode'] = 'vision_agent'
+    Image.new('RGB', (600, 800), 'white').save(s.pages[1])
+    s.submit_grades(grade_payload(position_confidence=confidence))
+    assert s.grades[0]['bbox_ok'] is accepted
+    assert s.grades[0]['draw'] is accepted
+
+
 @pytest.mark.parametrize('ids,text,complete', [([], '', False), (['p2:b1'], '3', True), (['p2:b9'], '2', True)])
 def test_visual_box_recovers_missing_or_rejected_ocr(tmp_path, monkeypatch, ids, text, complete):
     s = state(tmp_path, monkeypatch); reviewed(s)
