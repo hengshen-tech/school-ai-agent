@@ -100,9 +100,9 @@ Marking conventions:
 Annotation requirements:
 
 - Automatically locate the corresponding answer regions.
-- Place marks close to the relevant student answers.
+- Prefer placing marks to the right of the relevant student answers; if there is no room on the right, draw directly over the corresponding answer area.
 - Preserve original text, handwriting, diagrams, and page layout.
-- Avoid covering important content.
+- Keep marks associated with the correct answer area; overlaying that answer is allowed when there is no room on its right.
 - Maintain the original page dimensions and image quality.
 - Map annotation coordinates back to the original image.
 

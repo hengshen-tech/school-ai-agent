@@ -109,7 +109,7 @@ SDK 开放 `Read` 与 `Bash`，不配置 MCP 或子代理。Read 仅能读取本
 
 ## 视觉定位与卷面标记
 
-Agent 返回每题的 `page`、`answer_bbox` 和 `position_confidence`。坐标为对应原图 0–1000 的归一化坐标；裁图必须映射回原图。后端检查页码、范围、置信度和答案区重叠，定位置信度达到 70% 时接受，低于 70% 时拒绝。位置可靠时在答案附近画红勾、红叉、黄问号，不覆盖答案框；位置无法确认或无落笔空间时保留人工框选。
+Agent 返回每题的 `page`、`answer_bbox` 和 `position_confidence`。坐标为对应原图 0–1000 的归一化坐标；裁图必须映射回原图。后端检查页码、范围、置信度和答案区重叠，定位置信度达到 70% 时接受，低于 70% 时拒绝。位置可靠时优先在答案右侧画红勾、红叉、黄问号；右侧放不下时直接画在本题答案区域上。位置无法确认时保留人工框选。
 
 标注保留原图像素尺寸与 DPI，PDF 使用 ReportLab 嵌入原图，保持学生作答页顺序。只有参考用途的原题、标准答案页不混入学生答卷 PDF。人工改判自动切到对应文件的标注页；未知分值时改判不会沿用过期总分。
 
@@ -121,38 +121,6 @@ Agent 返回每题的 `page`、`answer_bbox` 和 `position_confidence`。坐标�
 - 旧记录继续可查看和下载，但未经新流程审核的旧结果不会作为新上传的缓存直接返回。旧试卷在新流程使用时补审核，人工确认答案予以保留。
 - 同卷匹配保留数学结构检查，数字、运算符、括号或变量变化时不能套用原答案。
 - 未明确选卷时，自动复用还要求原题图片一致，避免同题干不同配图套用旧答案；扫描件不同可选择已备试卷。重新批改优先使用试卷库里老师最新确认的答案。
-
-## 目录
-
-```
-backend/app/   main.py（批改 API）· school.py（班级 / 任务 / 报告 API）· workflow.py（输入准备与结果校验）· submission_agent.py（单 Agent 图片输入）· pipeline.py（历史兼容与绘图）
-               agents.py（Agent SDK 封装）· prompts.py · analytics.py（学情统计）
-               ocr.py（历史 OCR 工件兼容）· visual_tools.py（任务限定的动态裁图/算术）· materials.py（材料存储、页码和 Agent 输出验证）· store.py（试卷库、缓存、花名册）· imaging.py（PDF/裁剪/标注）· config.py
-frontend/      index.html · app.js · style.css（无构建步骤，由后端直接托管）
-tests/         mock_llm.py（本地模拟的 Anthropic 兼容接口）· make_sample.py（生成示例试卷）
-```
-
-## 本地开发 / 不花钱跑通流程
-
-```bash
-pip install -r backend/requirements.txt
-python tests/make_sample.py sample.png
-(cd tests && uvicorn mock_llm:app --port 9911) &
-(cd backend && DATA_DIR=./data uvicorn app.main:app --port 8001)
-# 模型设置接口地址填 http://127.0.0.1:9911，Key 填 test-only。模拟模型只返回固定合成样例结果。
-```
-
-## 测试
-
-```bash
-python tests/test_core.py     # 不依赖模型的单元测试：答案比对、坐标规整、OCR 解析、试卷匹配、答案编辑
-python -m pytest tests/      # 需额外安装 pytest / pytest-asyncio
-python -m pytest tests/test_vision_exam.py -q # 纯视觉、裁图映射、标注和 PDF，无付费调用
-node --test tests/test_frontend.cjs # 前端异步导航、流式状态和原图预览回归，无额外 npm 依赖
-```
-
-试卷匹配除了题干相似度，还要求题干里的数字序列完全一致（短试卷和题干指纹命中也要检查）：只改了数字的 A/B 卷不会被当成同一套；
-单道题的数字和试卷库里不一致时，这道题不套用答案，转人工复核。
 
 ## 注意
 

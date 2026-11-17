@@ -132,7 +132,7 @@ def _mark(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, s: int):
 
 
 def annotate(page_path: Path, out_path: Path, items: list[dict]):
-    """items: [{status, bbox_px, draw}]；只在位置已确认（draw=True）的题目上落笔。"""
+    """位置确认后优先在答案右侧落笔，右侧无空间则画在答案区域上。"""
     img = Image.open(page_path).convert("RGB")
     draw = ImageDraw.Draw(img)
     short = min(img.size)
@@ -151,19 +151,14 @@ def annotate(page_path: Path, out_path: Path, items: list[dict]):
         s = max(8, round(min(max((y2 - y1) * .8, short * .018), short * .035)))
         cy = min(max(0, (y1 + y2 - s) // 2), img.height - s)
         cx = min(max(0, (x1 + x2 - s) // 2), img.width - s)
-        candidates = [(x2 + gap, cy), (x1 - s - gap, cy), (cx, y1 - s - gap), (cx, y2 + gap)]
-        for x, y in candidates:
-            area = [x, y, x + s, y + s]
-            if x < 0 or y < 0 or x + s > img.width or y + s > img.height:
-                continue
-            if any(intersects(area, other) for other in occupied + marks):
-                continue
-            _mark(draw, it["status"], int(x), int(y), s)
-            marks.append(area)
-            break
-        else:
-            it["draw"] = False
-            it["position_note"] = "答案旁没有可用的标注空间，请人工确认"
+        x, y = x2 + gap, cy
+        area = [x, y, x + s, y + s]
+        if x < 0 or y < 0 or x + s > img.width or y + s > img.height or any(
+            intersects(area, other) for other in occupied + marks
+        ):
+            x, y = cx, cy
+        _mark(draw, it["status"], int(x), int(y), s)
+        marks.append([x, y, x + s, y + s])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, dpi=_density(img))
 
