@@ -490,11 +490,22 @@ function firstStudentPage(job) {
   return job.graded_pages?.[0] || job.materials?.find((m) => m.role === "student_work")?.page || 1;
 }
 function pageTabs(job) {
-  return Array.from({length:job.page_count || 0}, (_,i) => {
-    const m = job.materials?.find((x) => x.page === i + 1);
-    const label = m ? `${MATERIAL_ROLES[m.role] || "材料"} · ${m.filename || "文件"} 第 ${m.source_page || 1} 页` : `第 ${i+1} 页`;
-    return `<button data-p="${i+1}">${esc(label)}</button>`;
-  }).join("");
+  const groups = [];
+  for (let i = 1; i <= (job.page_count || 0); i++) {
+    const m = job.materials?.find((x) => x.page === i);
+    const role = MATERIAL_ROLES[m?.role || m?.classified_role || m?.requested_role] || "材料";
+    const filename = m?.filename || "全部页面", sourcePage = m?.source_page || i;
+    const key = JSON.stringify([m?.input_index ?? filename, role]);
+    let group = groups[groups.length - 1];
+    if (!group || group.key !== key || sourcePage <= group.pages[group.pages.length - 1].sourcePage) {
+      group = {key, role, filename, pages:[]}; groups.push(group);
+    }
+    group.pages.push({page:i, sourcePage});
+  }
+  return groups.map((g) => `<div class="page-group" role="group" aria-label="${esc(g.role + '：' + g.filename)}">
+    <div class="page-source"><div><span class="page-source-role">${esc(g.role)}</span><span class="page-source-count">${g.pages.length} 页</span></div><span class="page-source-name" title="${esc(g.filename)}">${esc(g.filename)}</span></div>
+    <div class="page-numbers">${g.pages.map((p) => `<button data-p="${p.page}" class="${p.page === page ? 'on' : ''}" aria-label="${esc(g.role + '，' + g.filename + '，第 ' + p.sourcePage + ' 页')}"${p.page === page ? ' aria-current="page"' : ''}>${p.sourcePage}</button>`).join('')}</div>
+  </div>`).join('');
 }
 function updateJobPreview() {
   const count = activeJob?.page_count || 0;
@@ -576,7 +587,11 @@ function drawPage() {
   img.onload = () => { if (valid()) { img.hidden = false; wait.hidden = true; } };
   img.onerror = () => { if (valid()) { wait.textContent = "页面加载失败，请重试"; $("#retryPage").hidden = false; } };
   img.src = url;
-  $$("#pageTabs button").forEach((x) => x.classList.toggle("on", +x.dataset.p === page));
+  $$("#pageTabs button").forEach((x) => {
+    const current = +x.dataset.p === page;
+    x.classList.toggle("on", current);
+    if (current) x.setAttribute("aria-current", "page"); else x.removeAttribute("aria-current");
+  });
 }
 $("#showAnn").onclick = () => { if (!cur) return; kind = "annotated"; drawPage(); };
 $("#showRaw").onclick = () => { kind = "raw"; drawPage(); };

@@ -389,6 +389,17 @@ test('result opens first student page and tabs identify each material source',as
   await s.run('openResult("bundle",false,undefined,viewGeneration)');
   assert.equal(s.run('page'),3);assert.match(s.el('#pageTabs').innerHTML,/试卷.*paper.pdf/);assert.match(s.el('#pageTabs').innerHTML,/标准答案.*key.pdf/);assert.match(s.el('#pageTabs').innerHTML,/学生作答.*work.png/);
 });
+test('page navigation groups source files while retaining global page targets',()=>{
+  const s=setup();
+  const materials=[...Array.from({length:8},(_,i)=>({page:i+1,input_index:1,filename:'同名卷.pdf',source_page:i+1,role:'question_paper'})),
+    {page:9,input_index:2,filename:'同名卷.pdf',source_page:1,role:'student_work'}];
+  s.context.bundle={page_count:9,materials};
+  const html=s.run('page=9;pageTabs(bundle)');
+  assert.equal((html.match(/class="page-group"/g)||[]).length,2);
+  assert.equal((html.match(/class="page-source-name"/g)||[]).length,2);
+  assert.match(html,/data-p="8"[^>]*>8<\/button>/);
+  assert.match(html,/data-p="9"[^>]*aria-current="page"[^>]*>1<\/button>/);
+});
 test('cached single upload keeps a result link and cache hint on its retained row',async()=>{
   const s=setup();
   s.context.fetch=async(url,opt={})=>({ok:true,json:async()=>opt.method==='POST'?{id:'cached',cached:true}:url.endsWith('/status')?{id:'cached',status:'done',last_event_id:1}:[]});
