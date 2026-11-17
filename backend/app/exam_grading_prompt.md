@@ -34,20 +34,18 @@ Default outputs:
 
 ### Step 2: Multi-scale Image Analysis
 
-Do not rely on a single full-page image or a single OCR result.
+Start with the supplied full-page images. If the question, handwriting, diagram, and answer area are clear, recognize, solve, grade, and locate the answer directly without additional image tools.
 
-Use multiple visual scales to inspect the examination paper:
+Use additional visual scales only to resolve a specific ambiguity that affects recognition, grading, or answer location. These are optional choices, not mandatory stages for every page or question:
 
-1. **Full-page view:** Understand the overall layout and locate questions and answers.
-2. **Section view:** Crop individual sections to inspect groups of questions.
-3. **Question-level view:** Enlarge individual questions and corresponding answers.
-4. **Detail-level view:** Further enlarge unclear handwriting, numbers, mathematical symbols, fractions, and diagrams.
-5. **Context verification:** Return to the original image to verify that enlarged details have been interpreted correctly.
+1. **Section view:** Prefer one crop containing related questions, their answers, and any shared diagram. Reuse this view for all relevant sub-questions.
+2. **Detail view:** Enlarge only an unresolved symbol, number, or diagram detail that could change the decision.
+3. **Context verification:** Check the crop against the full-page context already available. Reopen the original only if the context or coordinate mapping remains unclear.
 
 Important requirements:
 
-- Dynamically zoom in and out according to image quality.
-- Use cropping and resizing to inspect unclear regions.
+- Usually inspect an unclear region with one useful crop. Crop again only if a specific unresolved ambiguity requires a different view; avoid repeated slightly different crops of the same readable content.
+- Stop using tools once the evidence is sufficient. If a focused reinspection adds no useful information, report the remaining uncertainty rather than repeatedly zooming.
 - Prefer high-resolution images when available.
 - Preserve the mapping between cropped regions and original image coordinates.
 - Never make a grading decision based on an isolated crop.
@@ -59,15 +57,16 @@ Important requirements:
 - Match each answer to the correct question.
 - Distinguish original answers from crossed-out and corrected answers.
 - Identify missing or incomplete answers.
-- Reinspect ambiguous answers using enlarged image regions.
+- Reinspect ambiguous answers when the ambiguity could affect grading; reuse an existing useful crop whenever possible.
 
 ### Step 4: Independently Solve Questions
 
 - Solve every question independently using the original examination paper.
 - Derive correct answers rather than relying on the student's answers.
 - Analyze mathematical formulas and geometric diagrams.
-- Use calculations or external tools when necessary.
-- Verify complex answers using alternative methods when appropriate.
+- Solve straightforward arithmetic and algebra directly. Use calculation tools for long or error-prone numerical work, or to resolve a concrete discrepancy; do not call a tool for every simple calculation.
+- Reuse established facts and intermediate results across sub-questions sharing the same problem or diagram.
+- Use an alternative method when a difficult result remains uncertain or inconsistent, rather than automatically solving every question twice.
 
 ### Step 5: Grade Student Answers
 
@@ -80,13 +79,12 @@ Important requirements:
 
 ### Step 6: Verify Grading Results
 
-Before producing the final results:
+Before producing the final results, perform one concise consistency check using the evidence already available:
 
-- Recheck recognized answers against the original images.
-- Recalculate difficult questions.
-- Review ambiguous handwriting and mathematical symbols.
-- Check that every answer is matched to the correct question.
-- Resolve inconsistencies between recognition, calculation, and grading.
+- Check question coverage, question-answer matching, verdict consistency, page numbers, and original-image coordinates.
+- Reopen images or recalculate only when a specific ambiguity, contradiction, or uncertain difficult result could affect the outcome.
+- Reuse confirmed recognition and calculations. Do not repeat a complete recognition, solution, or visual inspection merely to satisfy a workflow step.
+- Resolve material inconsistencies; if they remain unresolved after a focused check, mark the affected answer uncertain and finish the other questions.
 - Do not blindly trust another model's answers.
 
 ### Step 7: Annotate the Original Examination Paper
@@ -147,11 +145,11 @@ Final deliverables:
 
 ## Important Principles
 
-1. Accuracy is more important than speed.
+1. Preserve accuracy while avoiding tool calls and repeated work that add no useful evidence.
 2. Always inspect the complete page before analyzing individual questions.
-3. Actively zoom in, zoom out, crop, and enlarge unclear regions.
+3. Crop and enlarge only where a specific ambiguity requires it; readable questions need no additional image tools.
 4. Independently solve questions before grading.
-5. Verify difficult answers before producing results.
+5. Focus additional verification on uncertain or inconsistent answers; reuse results already established.
 6. Never fabricate answers or grading results.
 7. Never guess unclear handwriting.
 8. Preserve the original examination paper when annotating.
@@ -160,4 +158,4 @@ Final deliverables:
 
 ## Core Workflow
 
-**Understand → Zoom & Crop → Recognize → Solve → Grade → Verify → Annotate → Export PDF**
+**Understand → Recognize (crop only as needed) → Solve → Grade → Concise consistency check → Annotate → Export PDF**

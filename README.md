@@ -64,7 +64,7 @@ docker compose up -d --build
 
 后端只把 PDF / 图片转换为原图，不执行 OCR 或预先分类。Agent 自己根据原图和 requested_role 识别材料用途，然后在同一会话内自主看图、独立解题、核算和复核。
 
-完整 Prompt 原文保存在 `backend/app/exam_grading_prompt.md`；`prompts.SINGLE_SUBMISSION` 追加应用字段、题号层级、老师答案处理、原图坐标及输出 JSON 格式。模型输出材料、题目、解题结果、判分和答案框，后端校验并保存，生成标注图和 PDF。
+基于用户提供内容调整的主 Prompt 保存在 `backend/app/exam_grading_prompt.md`；`prompts.SINGLE_SUBMISSION` 追加应用字段、题号层级、老师答案处理、原图坐标及输出 JSON 格式。清晰图片默认直接处理，有具体疑点才裁剪或核算；相邻小题复用裁图与中间结果，最后做一次简短一致性检查，避免逐题反复放大和重复解题。模型输出材料、题目、解题结果、判分和答案框，后端校验并保存，生成标注图和 PDF。
 
 SDK 开放 `Read` 与 `Bash`，不配置 MCP 或子代理。Read 仅能读取本次上传/参考原图及裁图片；Bash 仅能执行输入给出的裁图或安全算术命令，不能运行任意 shell 命令。工具作用域由 PreToolUse Hook 检查，不编排模型认知步骤。[官方 SDK 参考](https://code.claude.com/docs/en/agent-sdk/python)。
 
