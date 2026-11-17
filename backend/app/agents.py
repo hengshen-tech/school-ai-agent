@@ -14,7 +14,8 @@ import weakref
 from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
                               ResultMessage, TextBlock, ToolUseBlock)
 
-from .config import AGENT_TIMEOUT_S, WORK_DIR
+from .config import AGENT_TIMEOUT_S, MODEL_EFFORT, WORK_DIR
+from .agent_logging import log_event, log_text
 from claude_agent_sdk.types import StreamEvent
 
 _MODEL_LIMITS = weakref.WeakKeyDictionary()
@@ -33,7 +34,7 @@ class AgentError(RuntimeError):
     pass
 
 
-def _env(cfg: dict, effort="high") -> dict:
+def _env(cfg: dict, effort=MODEL_EFFORT) -> dict:
     m = cfg["model"]
     return {
         "ANTHROPIC_BASE_URL": cfg["base_url"].rstrip("/"),
@@ -54,8 +55,9 @@ def _env(cfg: dict, effort="high") -> dict:
 
 async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
                     allowed_tools: list | None = None, max_turns: int = 1, on_tool=None,
-                    emit=None, stage="model", label="", effort="high", require_success=False,
-                    builtin_tools=None, work_dir=None, hooks=None, env_overrides=None) -> str:
+                    emit=None, stage="model", label="", effort=MODEL_EFFORT, require_success=False,
+                    builtin_tools=None, work_dir=None, hooks=None, env_overrides=None,
+                    submission_id=None) -> str:
     """运行一个 Agent 并返回它最后一段文本。blocks 为 Anthropic 格式的内容块（text / image）。"""
     if not cfg.get("api_key"):
         raise AgentError("尚未配置 API Key，请先到「模型设置」填写。")
@@ -79,7 +81,10 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
     call_id = uuid.uuid4().hex[:12]
     queued_at = time.monotonic()
     started_at, first_output, usage, buffer = None, None, None, []
-    last_flush, last_activity = 0.0, 0.0
+    last_flush = 0.0
+
+    def console(event, **fields):
+        log_event(event, submission_id=submission_id, call_id=call_id, **fields)
 
     def report(status, message="", **extra):
         if emit:
@@ -93,9 +98,10 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
         last_flush = time.monotonic()
 
     async def _go():
-        nonlocal first_output, usage, last_activity
+        nonlocal first_output, usage
         last_text, result, err, result_seen = "", None, None, False
         streamed = False
+        thinking_reported = False
         async with ClaudeSDKClient(opts) as client:
             async def gen():
                 yield {"type": "user", "message": {"role": "user", "content": blocks},
@@ -112,27 +118,32 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
                         buffer.append(delta.get("text", ""))
                         if now - last_flush >= .1:
                             flush()
-                    elif delta.get("type") == "thinking_delta" and now - last_activity >= 2:
-                        last_activity = now
-                        report("info", "模型正在思考", kind="activity")
+                    elif delta.get("type") == "thinking_delta" and not thinking_reported:
+                        thinking_reported = True
+                        report("info", "模型正在思考...", kind="activity", activity_type='thinking')
                 elif isinstance(msg, AssistantMessage):
+                    texts = [b.text for b in msg.content if isinstance(b, TextBlock)]
+                    log_text('agent_output', '\n'.join(texts), submission_id=submission_id, call_id=call_id,
+                        incomplete=msg.stop_reason == 'max_tokens')
                     if require_success and getattr(msg, 'stop_reason', None) == 'max_tokens':
                         raise AgentError('模型输出被截断，请减少本次材料后重试')
-                    texts = [b.text for b in msg.content if isinstance(b, TextBlock)]
                     if texts:
                         last_text = "\n".join(texts)
                         if not streamed:
                             first_output = first_output or time.monotonic()
                             buffer.append(last_text)
                             flush()
-                    if on_tool:
-                        for b in msg.content:
-                            if isinstance(b, ToolUseBlock):
+                    for b in msg.content:
+                        if isinstance(b, ToolUseBlock):
+                            if on_tool:
                                 on_tool(b.name, b.input)
                 elif isinstance(msg, ResultMessage):
                     result_seen = True
                     result = msg.result
                     usage = msg.usage
+                    console('result', subtype=msg.subtype, is_error=msg.is_error, num_turns=msg.num_turns, usage=usage)
+                    if result and result != last_text:
+                        log_text('agent_result', result, submission_id=submission_id, call_id=call_id)
                     if require_success and (msg.subtype != 'success' or msg.is_error or
                                             getattr(msg, 'stop_reason', None) == 'max_tokens'):
                         err = '模型输出被截断' if getattr(msg, 'stop_reason', None) == 'max_tokens' else msg.result or msg.subtype
@@ -145,20 +156,35 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
         return result or last_text
 
     try:
+        console('queued', model=cfg['model'], effort=effort, max_turns=max_turns)
         report("info", f"{label}等待模型调用名额".strip(), kind="activity")
         async with _model_limit():
             started_at = time.monotonic()
+            console('started', queue_s=round(started_at - queued_at, 3))
+            log_text('system_prompt', system, submission_id=submission_id, call_id=call_id)
+            for index, block in enumerate(blocks):
+                if block.get('type') == 'text':
+                    log_text('input_text', block.get('text', ''), submission_id=submission_id, call_id=call_id, block=index)
+                elif block.get('type') == 'image':
+                    console('input_image', block=index, media_type=block.get('source', {}).get('media_type'))
             report("info", f"{label}模型开始处理（{effort}）", kind="activity")
             out = await asyncio.wait_for(_go(), AGENT_TIMEOUT_S)
     except asyncio.TimeoutError:
+        console('failed', reason='timeout')
         raise AgentError("模型调用超时")
-    except AgentError:
+    except asyncio.CancelledError:
+        console('cancelled', reason='task_cancelled')
+        raise
+    except AgentError as exc:
+        console('failed', reason=str(exc))
         raise
     except Exception as e:  # CLI 进程错误等
+        console('failed', reason=str(e)[:400])
         raise AgentError(f"Agent 运行失败：{str(e)[:400]}")
     finally:
         flush()
         now = time.monotonic()
+        console('finished', elapsed_s=round(now - started_at, 3) if started_at else None, usage=usage)
         report("info", kind="metric", metric={"call_id": call_id, "stage": stage, "label": label,
                "model": cfg["model"], "effort": effort, "usage": usage,
                "queue_s": round((started_at or now) - queued_at, 3),
@@ -171,20 +197,52 @@ async def run_agent(cfg: dict, *, system: str, blocks: list, mcp_server=None,
     return out
 
 
-def extract_json(text: str) -> dict:
-    t = text.strip()
-    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", t, re.S)
-    if m:
-        t = m.group(1)
-    else:
-        i, j = t.find("{"), t.rfind("}")
-        if i < 0 or j <= i:
-            raise ValueError("no json object")
-        t = t[i:j + 1]
-    return json.loads(t)
+def extract_json(text: str, *, result_filter=None) -> dict:
+    """Find complete top-level documents without joining or mining nested rows."""
+    candidates, stack = {}, []
+    start, quoted, escaped, parse_error = None, False, False, None
+    for index, char in enumerate(text):
+        if start is None:
+            if char in '{[':
+                start, stack = index, [char]
+            continue
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char in '{[':
+            stack.append(char)
+        elif char in '}]':
+            if not stack or stack[-1] != ('{' if char == '}' else '['):
+                raise ValueError('JSON 括号不匹配，不能确认完整结果')
+            stack.pop()
+            if not stack:
+                try:
+                    value = json.loads(text[start:index + 1])
+                    if isinstance(value, dict) and (result_filter is None or result_filter(value)):
+                        fingerprint = json.dumps(value, sort_keys=True, ensure_ascii=False)
+                        candidates[fingerprint] = value
+                except json.JSONDecodeError as exc:
+                    parse_error = exc
+                start = None
+    if start is not None:
+        raise ValueError('JSON 对象或数组未闭合，输出可能被截断')
+    if len(candidates) > 1:
+        raise ValueError('返回了多份不同的完整 JSON，无法确定唯一结果')
+    if candidates:
+        return next(iter(candidates.values()))
+    if result_filter is not None:
+        raise ValueError('未找到符合预期结构的完整 JSON 对象；不能将分段结果直接拼接')
+    raise ValueError(f'未找到完整 JSON 对象：{parse_error}' if parse_error else '未找到完整 JSON 对象（不接受数组）')
 
 
-async def run_json_agent(cfg, *, system, blocks, attempts=2, **kw) -> dict:
+async def run_json_agent(cfg, *, system, blocks, attempts=2, result_filter=None, **kw) -> dict:
     """运行 Agent 并解析 JSON；解析失败时带着提醒重试一次。"""
     last = None
     for attempt in range(attempts):
@@ -194,10 +252,11 @@ async def run_json_agent(cfg, *, system, blocks, attempts=2, **kw) -> dict:
             {"type": "text", "text": "上一次的输出不是合法 JSON。请严格只输出一个 JSON 对象。"}]
         out = await run_agent(cfg, system=system, blocks=b, **kw)
         try:
-            obj = extract_json(out)
+            obj = extract_json(out, result_filter=result_filter)
             if not isinstance(obj, dict):
                 raise ValueError("not a json object")
             return obj
         except Exception as e:
             last = e
+            log_event('json_parse_failed', submission_id=kw.get('submission_id'), attempt=attempt + 1, reason=str(e))
     raise AgentError(f"模型输出无法解析为 JSON（{last}）")

@@ -128,7 +128,7 @@ def test_submission_mode_and_interrupted_retry(monkeypatch):
         assert r.status_code == 200
         sid = r.json()["id"]
         status = client.get(f"/api/submissions/{sid}/status").json()
-        assert status["ocr_mode"] == "deepseek_ocr" and status["effort"] == "high"
+        assert status["ocr_mode"] == "deepseek_ocr" and status["effort"] == "low"
         assert client.post(f"/api/submissions/{sid}/retry").status_code == 409
     # Lifespan shutdown cancels owned jobs and marks them interrupted.
     with TestClient(main.app) as client:
@@ -202,7 +202,7 @@ def test_legacy_pipeline_finishes_after_preview_and_can_reopen(monkeypatch):
                 break
             time.sleep(.01)
         result = client.get(f"/api/submissions/{sid}").json()
-        assert result["summary"]["correct"] == 1 and result["effort"] == "high"
+        assert result["summary"]["correct"] == 1 and result["effort"] == "low"
         assert result["timings"]["review"] >= 0 and result["ocr_mode"] == "deepseek_ocr"
         assert client.get(f"/api/submissions/{sid}/pdf").content.startswith(b"%PDF")
         assert client.get(f"/api/submissions/{sid}/pages/1").status_code == 200

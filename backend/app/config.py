@@ -16,6 +16,7 @@ PAPER_MATCH_THRESHOLD = float(os.environ.get("PAPER_MATCH_THRESHOLD", "0.85"))
 # 发送给模型的整页图片长边上限（像素）
 MODEL_IMAGE_MAX_SIDE = int(os.environ.get("MODEL_IMAGE_MAX_SIDE", "2000"))
 AGENT_TIMEOUT_S = int(os.environ.get("AGENT_TIMEOUT_S", "1800"))
+MODEL_EFFORT = 'low'
 
 DEFAULTS = {
     "model": os.environ.get("LLM_MODEL", "deepseek-flash"),  # DeepSeek V4.1 Flash 的官方模型 ID
@@ -63,4 +64,4 @@ def public_settings(s: dict) -> dict:
     return {"model": s["model"], "base_url": s["base_url"], "api_key_masked": masked,
             "has_key": bool(key), "agentic_zoom": bool(s.get("agentic_zoom", True)),
             "use_ocr": False, "is_deepseek": bool(ocr.endpoint(s)),
-            "ocr_active": False, "ocr_available": False, "effort": "high"}
+            "ocr_active": False, "ocr_available": False, "effort": MODEL_EFFORT}

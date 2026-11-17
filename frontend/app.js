@@ -31,6 +31,7 @@ const STEPS = [
 let cur = null, page = 1, kind = "annotated", es = null, backTo = null, taskTimer = null;
 let manualPosition = null;
 let manualReviewQueue = Promise.resolve();
+const stoppingJobs = new Set();
 let classes = [], allStudents = [], allTasks = [];
 let activeJob = null, viewGeneration = 0, stageState = {}, seenEvents = new Set(), lastEventId = 0;
 let stageFolds = {}, jobsCache = [], jobsLoading = false, settingsCache = {};
@@ -181,7 +182,7 @@ function updateUploadMode() {
   for (const id of ["uClassWrap", "uTaskWrap", "uStudentWrap", "uPaperWrap"]) $("#" + id).hidden = uploadMode === "prepare";
   $("#uploadTitle").textContent = uploadMode === "prepare" ? "先备好这套试卷" : "今天批改哪一份？";
   $("#uploadLead").textContent = uploadMode === "prepare"
-    ? "上传试卷和可选参考答案。主 Agent 独立解题，审核子 Agent 核对后存入试卷库，争议题可人工确认。"
+    ? "上传试卷和可选参考答案。AI 独立解题后存入试卷库，答案默认直接使用，需要时可点击「编辑答案」修改。"
     : "添加试卷、可选参考答案和一位学生的作答。一个 Agent 直接看图，按需裁剪放大、独立解题、批改和复核，生成红勾、红叉及黄问号。";
 }
 $("#uMode").onchange = (e) => { uploadMode = e.target.value === "prepare" ? "prepare" : "grade"; updateUploadMode(); renderMaterials(); };
@@ -305,7 +306,7 @@ $("#jobFilter").onchange = renderJobs;
 /* ---------- 单份：实时进度 ---------- */
 function renderSteps(state, reset = false) {
   if (reset || !$("#steps").children.length) {
-    $("#steps").innerHTML = STEPS.map(([k,name,desc]) => `<li data-stage="${k}"><span class="ico"></span><details class="stage-detail"><summary><b>${name}</b><span class="stage-time"></span><small class="stage-summary">${desc}</small>${["parse","solve","answer_review","grade","locate","review"].includes(k) ? '<small class="effort">推理强度 high</small>' : ""}</summary><pre class="stage-log"></pre><details class="raw-output"><summary>模型原始输出</summary></details></details></li>`).join("");
+    $("#steps").innerHTML = STEPS.map(([k,name,desc]) => `<li data-stage="${k}"><span class="ico"></span><details class="stage-detail"><summary><b>${name}</b><span class="stage-time"></span><small class="stage-summary">${desc}</small>${["parse","solve","answer_review","grade","locate","review"].includes(k) ? '<small class="effort"></small>' : ""}</summary><pre class="stage-log"></pre><details class="raw-output"><summary>模型原始输出</summary></details></details></li>`).join("");
     $$("#steps [data-stage]").forEach((node) => {
       const detail = node.querySelector(".stage-detail");
       detail.addEventListener("toggle", () => { if (detail.open !== detail._defaultOpen) stageFolds[node.dataset.stage] = detail.open; });
@@ -323,7 +324,8 @@ function renderSteps(state, reset = false) {
         : ["answer_review", "locate"].includes(k) && activeJob?.workflow_version === 1);
     const ocrPosition = k === "review" && activeJob?.position_method === "ocr_blocks";
     node.querySelector("b").textContent = st.title || stepName(k);
-    const effort = node.querySelector(".effort"); if (effort) effort.hidden = ocrPosition;
+    const effort = node.querySelector(".effort");
+    if (effort) { effort.hidden = ocrPosition; effort.textContent = `推理强度 ${activeJob?.effort || "low"}`; }
     node.querySelector(".ico").textContent = {done:"✓",skip:"↷",fail:"!"}[cls] || "";
     node.querySelector(".stage-summary").textContent = st.message || (ocrPosition ? "使用 OCR 答案文字块坐标，无需调用复核 Agent" : desc);
     const elapsed = st.started_at != null && cls === "run"
@@ -360,8 +362,10 @@ function applyJobEvent(e) {
     output.text += e.text || ""; st.outputs.set(callId, output);
   }
   else {
-    if (e.message) st.logs.push(e.message);
-    if (e.kind === "metric" && e.metric) st.logs.push(`${e.metric.label || "模型调用"} · ${e.metric.model || ""} · ${e.metric.effort || "high"} · ${modelMetricText(e.metric)}`);
+    const thinking = e.activity_type === 'thinking' || /^模型正在思考[.…]*$/.test(e.message || '');
+    if (e.message && (!thinking || !st.thinkingShown)) st.logs.push(thinking ? '模型正在思考...' : e.message);
+    if (thinking) st.thinkingShown = true;
+    if (e.kind === "metric" && e.metric) st.logs.push(`${e.metric.label || "模型调用"} · ${e.metric.model || ""} · ${e.metric.effort || activeJob?.effort || "low"} · ${modelMetricText(e.metric)}`);
     if ((!e.kind || e.kind === "status") && (!old.t || !e.t || e.t >= old.t)) {
       const running = old.started_at != null && ["start","info"].includes(old.status);
       Object.assign(st,e);
@@ -383,6 +387,7 @@ function openDesk(title) {
   $("#qlist").innerHTML = ""; $("#pageTabs").innerHTML = "";
   $("#regrade").hidden = $("#pdfBtn").hidden = $("#dStudentWrap").hidden = true;
   $("#retryJob").hidden = true; $("#jobNotice").textContent = ""; $("#jobMetrics").hidden = true;
+  $("#stopJob").hidden = true;
   $("#pageImg").removeAttribute("src"); $("#pageImg").hidden = true; $("#paperWait").hidden = false; $("#paperWait").textContent = "等待页面预处理…";
 }
 function show_(v) {
@@ -396,14 +401,16 @@ async function watch(id, name, from) {
   if (from !== undefined) backTo = from;
   openDesk(name || "正在读取批改任务…");
   history.replaceState(null, "", "#grading/" + encodeURIComponent(id));
+  syncStopButton();
   const generation = viewGeneration, valid = () => generation === viewGeneration && activeJob?.id === id;
   stageState = {}; stageFolds = {}; seenEvents = new Set(); lastEventId = 0; renderSteps(stageState, true); drawPage();
   let snapshot;
   try {
     snapshot = await api(`/api/submissions/${id}/status`); if (!valid()) return;
     activeJob = {...activeJob,...snapshot}; $("#dTitle").textContent = snapshot.filename || name || id;
+    syncStopButton();
     stageState = snapshot.stages || {}; renderSteps(stageState); updateJobPreview();
-    $("#dBadges").innerHTML = `<span class="chip accent">${JOB_LABEL[jobStatus(snapshot)] || "批改中"}</span><span class="chip">${esc(snapshot.model || "")} · 推理强度 high</span><span class="chip">${snapshot.ocr_mode === "deepseek_ocr" ? "DeepSeek OCR 辅助" : "视觉识别"}</span>`;
+    $("#dBadges").innerHTML = `<span class="chip accent">${JOB_LABEL[jobStatus(snapshot)] || "批改中"}</span><span class="chip">${esc(snapshot.model || "")} · 推理强度 ${esc(snapshot.effort || "low")}</span><span class="chip">${snapshot.ocr_mode === "deepseek_ocr" ? "DeepSeek OCR 辅助" : "视觉识别"}</span>`;
     if (snapshot.error) showJobFailure(snapshot.error);
     if (jobStatus(snapshot) === "done" && !snapshot.last_event_id) { await openResult(id,false,undefined,generation); return; }
   } catch(e) { if(valid()) { $("#jobNotice").textContent = "无法读取任务：" + e.message; $("#retryJob").hidden = false; } return; }
@@ -413,31 +420,35 @@ async function watch(id, name, from) {
     if (!valid() || es !== source) return;
     let e; try { e = JSON.parse(m.data); if (!e.id && m.lastEventId) e.id = +m.lastEventId; } catch { return; }
     if (!applyJobEvent(e)) return;
-    $("#jobNotice").textContent = "";
+    if (!stoppingJobs.has(id)) $("#jobNotice").textContent = "";
     if (e.page_count) { activeJob.page_count = e.page_count; updateJobPreview(); }
     if (e.stage === "preprocess" && e.status === "done" && !activeJob.page_count) {
       api(`/api/submissions/${id}/status`).then((s) => {if (valid()) {activeJob = {...activeJob,...s};updateJobPreview();}}).catch(()=>{});
     }
     if (e.kind === "status" || !e.kind) {
-      if (STEPS.some(([k]) => k === e.stage)) activeJob.status = "running";
-      $("#dBadges").innerHTML = `<span class="chip accent">${JOB_LABEL[jobStatus(activeJob)] || "批改中"}</span><span class="chip">${esc(activeJob.model || "")} · 推理强度 high</span><span class="chip">${activeJob.ocr_mode === "deepseek_ocr" ? "DeepSeek OCR 辅助" : "视觉识别"}</span>`;
+      if (STEPS.some(([k]) => k === e.stage) && !snapshot.done) activeJob.status = "running";
+      $("#dBadges").innerHTML = `<span class="chip accent">${JOB_LABEL[jobStatus(activeJob)] || "批改中"}</span><span class="chip">${esc(activeJob.model || "")} · 推理强度 ${esc(activeJob.effort || "low")}</span><span class="chip">${activeJob.ocr_mode === "deepseek_ocr" ? "DeepSeek OCR 辅助" : "视觉识别"}</span>`;
     }
     renderSteps(stageState);
     if (e.stage === "done" || (snapshot.status === "done" && lastEventId >= snapshot.last_event_id)) {
       source.close(); if (es === source) es = null;
+      activeJob.status = 'done'; syncStopButton();
       try { await openResult(id,false,undefined,generation); } catch(err) { if (valid()) $("#jobNotice").textContent = "结果暂时无法读取：" + err.message; }
       refreshJobs();
     } else if (["error","interrupted"].includes(e.stage)) {
       source.close(); if (es === source) es = null; activeJob.status = e.stage === "error" ? "failed" : "interrupted"; showJobFailure(e.message); refreshJobs();
     }
+    syncStopButton();
   };
   source.onerror = () => {
     if (!valid() || es !== source) return;
+    if (stoppingJobs.has(id)) return;
     $("#jobNotice").textContent = "连接暂时中断，正在自动重连；服务端继续批改。";
     // EventSource sends Last-Event-ID when reconnecting; seenEvents also filters replayed IDs.
   };
 }
 function showJobFailure(message) {
+  $("#stopJob").hidden = true;
   for (const st of Object.values(stageState)) if (["start","info"].includes(st.status)) {
     st.status = "error"; st.message = message || "批改已中断";
     if (st.started_at != null) st.elapsed_s = (st.elapsed_s || 0) + Math.max(0, (activeJob?.finished_at || Date.now()/1000) - st.started_at);
@@ -445,6 +456,36 @@ function showJobFailure(message) {
   renderSteps(stageState);
   $("#jobNotice").textContent = "批改未完成：" + (message || "服务已中断，可重试"); $("#retryJob").hidden = false;
 }
+function syncStopButton() {
+  const button = $("#stopJob"), stopping = stoppingJobs.has(activeJob?.id);
+  button.hidden = !activeJob || !activeStatus(activeJob);
+  button.disabled = stopping;
+  button.textContent = stopping ? '正在停止…' : '停止任务';
+}
+$("#stopJob").onclick = async () => {
+  const id = activeJob?.id, generation = viewGeneration;
+  const valid = () => generation === viewGeneration && activeJob?.id === id;
+  if (!id || !activeStatus(activeJob) || stoppingJobs.has(id)) return;
+  stoppingJobs.add(id); syncStopButton();
+  $("#jobNotice").textContent = '正在停止任务…';
+  try {
+    const result = await post(`/api/submissions/${id}/stop`);
+    if (!valid()) return;
+    if (es) es.close(); es = null;
+    activeJob = {...activeJob, ...result};
+    for (const [key, state] of Object.entries(result.stages || {})) {
+      stageState[key] = {...stageState[key], ...state};
+    }
+    if (result.status === 'done') await openResult(id, false, undefined, generation);
+    else showJobFailure(result.error || '任务已停止，可重试');
+  } catch (error) {
+    if (valid()) $("#jobNotice").textContent = '停止任务失败：' + error.message;
+  } finally {
+    stoppingJobs.delete(id);
+    if (activeJob?.id === id) syncStopButton();
+    refreshJobs();
+  }
+};
 function firstStudentPage(job) {
   return job.graded_pages?.[0] || job.materials?.find((m) => m.role === "student_work")?.page || 1;
 }
@@ -478,7 +519,7 @@ async function openResult(id, fileCached, from, generation) {
   if (generation !== viewGeneration || activeJob?.id !== id) return;
   if (r.mode === "prepare") {
     show_("papers"); activeJob = null; cur = null;
-    await openPaper(r.paper_id);
+    await openPaper(r.paper_id, r.warnings || []);
     return;
   }
   if (!allStudents.length) await loadRoster();
@@ -486,6 +527,7 @@ async function openResult(id, fileCached, from, generation) {
   if (from !== undefined) backTo = from;
   cur = r; page = firstStudentPage(r); kind = "annotated";
   $("#dTitle").textContent = r.filename; activeJob = {...activeJob, ...r, status:"done"};
+  syncStopButton();
   const state = {...stageState};
   STEPS.forEach(([k]) => (state[k] = {...state[k], status: state[k]?.status || "done", elapsed_s:r.timings?.[k] ?? state[k]?.elapsed_s}));
   if (r.paper_cache_hit) state.solve = {...state.solve, status: "skip", message: "命中试卷库，直接复用已保存的标准答案" };
@@ -499,7 +541,7 @@ async function openResult(id, fileCached, from, generation) {
   else if (!r.student_id && r.detected_name) b.push(`<span class="chip review">卷面姓名「${esc(r.detected_name)}」未匹配到学生</span>`);
   if (r.execution_mode === "vision_agent") b.push(`<span class="chip accent">纯视觉 · 动态放大复核</span>`);
   else if (r.ocr_used) b.push(`<span class="chip accent">${r.vision_fallback_used ? "OCR＋模型辅助定位" : r.position_method === "ocr_blocks" ? "OCR 坐标直接标注" : "DeepSeek OCR 辅助定位"}</span>`);
-  b.push(`<span class="chip">推理强度 ${esc(r.effort || "high")}</span>`);
+  b.push(`<span class="chip">推理强度 ${esc(r.effort || activeJob?.effort || "high")}</span>`);
   b.push(`<span class="chip">答案来源：${r.answer_source === "teacher" ? "老师" : "AI"}</span>`, `<span class="chip">${esc(r.model)}</span>`, `<span class="chip">${r.elapsed_s}s</span>`);
   $("#dBadges").innerHTML = b.join("");
   $("#pageTabs").innerHTML = pageTabs(r);
@@ -610,7 +652,7 @@ function renderMetrics(r) {
   const box = $("#jobMetrics");
   const timings = Object.entries(r.timings || {});
   box.hidden = !timings.length && !(r.model_calls || []).length;
-  box.innerHTML = `<summary>耗时与模型调用</summary><p class="sub">总耗时 ${seconds(r.elapsed_s)} · 排队 ${seconds(r.queue_s)}</p>${timings.map(([k,v])=>`<div class="metric-row"><span>${esc(stepName(k,r))}</span><b>${seconds(v)}</b></div>`).join("")}${(r.model_calls||[]).map((m)=>`<div class="metric-row"><span>${esc(m.label || stepName(m.stage,r) || m.name || "模型调用")} · ${esc(m.model || r.model)} · ${esc(m.effort || "high")}<small>${esc(modelMetricText(m))}</small></span></div>`).join("")}`;
+  box.innerHTML = `<summary>耗时与模型调用</summary><p class="sub">总耗时 ${seconds(r.elapsed_s)} · 排队 ${seconds(r.queue_s)}</p>${timings.map(([k,v])=>`<div class="metric-row"><span>${esc(stepName(k,r))}</span><b>${seconds(v)}</b></div>`).join("")}${(r.model_calls||[]).map((m)=>`<div class="metric-row"><span>${esc(m.label || stepName(m.stage,r) || m.name || "模型调用")} · ${esc(m.model || r.model)} · ${esc(m.effort || r.effort || "low")}<small>${esc(modelMetricText(m))}</small></span></div>`).join("")}`;
 }
 
 function questionLabel(q) { return q.question_label || q.id; }
@@ -647,6 +689,7 @@ function applyManualOverride(qid, status) {
 }
 function drawResult() {
   const s = cur.summary;
+  if (cur.warnings?.length) $("#jobNotice").textContent = '参考答案提醒：' + cur.warnings.join('；');
   $("#summary").hidden = false;
   $("#summary").innerHTML = `
     <div class="tile"><b>${pct(s.accuracy)}</b><span>正确率（已判定）</span></div>
@@ -967,12 +1010,12 @@ async function loadPapers(sel) {
   $("#paperList").innerHTML = list.length ? list.map((p) => `
     <button class="item ${p.id === sel ? "on" : ""}" data-id="${p.id}"><div class="grow"><b>${esc(p.title)}</b>
       <small>${p.question_count} 道题 · 已使用 ${p.used_count} 次 · ${p.created_at}</small></div>
-      <span class="chip ${p.review_summary?.review ? "review" : ""}">${p.review_summary?.review ? `待确认 ${p.review_summary.review} 题` : p.workflow_version === 2 ? "已审核" : "历史试卷"}</span></button>`).join("")
+      <span class="chip">试卷库答案</span></button>`).join("")
     : `<div class="empty">试卷库是空的。点击「上传试卷建库」，或先批改一份学生作答。</div>`;
   $$("#paperList .item").forEach((b) => (b.onclick = () => openPaper(b.dataset.id)));
   if (!list.length && !sel) $("#paperDetail").hidden = true;
 }
-async function openPaper(id) {
+async function openPaper(id, warnings = []) {
   openedPaperId = id;
   const generation = viewGeneration, valid = () => generation === viewGeneration && openedPaperId === id;
   const p = await api(`/api/papers/${id}`);
@@ -980,36 +1023,56 @@ async function openPaper(id) {
   const amap = Object.fromEntries(p.answers.map((a) => [a.id, a]));
   const d = $("#paperDetail"); d.hidden = false;
   d.innerHTML = `<h2>${esc(p.title)}</h2>
-    <p class="sub">${esc(p.id)} · 答案版本 ${p.rev || 0} · 修改或确认后，打开批改记录点「重新批改」即可生效</p>
+    ${warnings.length ? `<p class="q-note">参考答案提醒：${esc(warnings.join('；'))}</p>` : ''}
+    <p class="sub">答案默认直接使用，无需审核。需要修改时点击「编辑答案」；保存后，已有批改记录需点「重新批改」才会使用新答案。</p>
+    <p class="sub">${esc(p.id)} · 答案版本 ${p.rev || 0}</p>
     ${(p.reference_pages || []).length ? `<details class="paper-sources"><summary>查看试卷原图</summary>${p.reference_pages.map((ref) => `<a class="link" href="/api/papers/${encodeURIComponent(id)}/pages/${ref.page}" target="_blank" rel="noopener">原图第 ${ref.page} 页</a>`).join(" · ")}</details>` : ""}
     <table><thead><tr><th>题号</th><th>题目</th><th style="width:26%">标准答案</th><th style="width:22%">知识点</th></tr></thead><tbody>
     ${p.questions.map((q) => { const a = amap[q.id] || {}; return `<tr><td>${esc(questionLabel(q))}</td><td>${esc(q.question)}</td>
-      <td><input aria-label="第 ${esc(questionLabel(q))} 题标准答案" data-id="${esc(q.id)}" data-f="answer" value="${esc(a.answer ?? "")}">
-        <small class="answer-review ${a.review_status === "review" ? "pending" : ""}">${({approved:"审核通过",ai_solved:"AI 独立解题",review:"待人工确认",manual_confirmed:"已人工确认"})[a.review_status] || "历史答案，使用前需审核"}</small>
+      <td><input readonly aria-label="第 ${esc(questionLabel(q))} 题标准答案" data-id="${esc(q.id)}" data-f="answer" value="${esc(a.answer ?? "")}">
+        <small class="answer-review">${!String(a.answer ?? '').trim() ? "答案缺失，可编辑补充" : a.edited || a.review_status === "manual_confirmed" ? "已人工编辑" : "默认直接使用"}</small>
         ${a.teacher_answer ? `<small class="answer-evidence">老师答案：${esc(a.teacher_answer)}</small>` : ""}
         ${a.review_answer || a.independent_answer ? `<small class="answer-evidence">独立验算：${esc(a.review_answer || a.independent_answer)}</small>` : ""}
-        ${a.review_reason ? `<small class="answer-evidence">${esc(a.review_reason)}</small>` : ""}
-        ${a.review_status !== "manual_confirmed" ? `<button class="link" type="button" data-confirm="${esc(q.id)}">确认当前答案</button>` : ""}</td>
-      <td><input data-id="${esc(q.id)}" data-f="knowledge" value="${esc(a.knowledge ?? "")}"></td></tr>`; }).join("")}
+        ${a.teacher_reference_issue ? `<small class="answer-evidence">参考答案提醒：${esc(a.teacher_reference_issue)}</small>` : ""}</td>
+      <td><input readonly aria-label="第 ${esc(questionLabel(q))} 题知识点" data-id="${esc(q.id)}" data-f="knowledge" value="${esc(a.knowledge ?? "")}"></td></tr>`; }).join("")}
     </tbody></table>
-    <div class="row" style="margin-top:16px"><button class="primary" id="saveAns">保存</button><span id="ansMsg" style="color:var(--ok);font-size:13.5px"></span></div>`;
+    <div class="row" style="margin-top:16px"><button type="button" class="ghost" id="editAnswers">编辑答案</button><button type="button" class="primary" id="saveAns" hidden>保存修改</button><button type="button" class="ghost" id="cancelAnswers" hidden>取消</button><span id="ansMsg" role="status" style="font-size:13.5px"></span></div>`;
+  let editing = false, saving = false;
+  function setEditing(value) {
+    editing = value;
+    $$("input[data-id]", d).forEach((input) => { input.readOnly = !value; });
+    $("#editAnswers").hidden = value;
+    $("#saveAns").hidden = $("#cancelAnswers").hidden = !value;
+  }
+  setEditing(false);
+  $("#editAnswers").onclick = () => { $("#ansMsg").textContent = ""; setEditing(true); };
+  $("#cancelAnswers").onclick = () => {
+    if (saving) return;
+    $$("input[data-id]", d).forEach((input) => { input.value = amap[input.dataset.id]?.[input.dataset.f] ?? ""; });
+    $("#ansMsg").textContent = "";
+    setEditing(false);
+  };
   function answerInputs() {
     const by = {};
     $$("input[data-id]", d).forEach((i) => ((by[i.dataset.id] ||= { id: i.dataset.id })[i.dataset.f] = i.value.trim()));
     return by;
   }
   async function saveAnswers(answers) {
+    if (!editing || saving) return;
+    saving = true;
+    $("#saveAns").disabled = $("#cancelAnswers").disabled = true;
+    $("#ansMsg").textContent = "正在保存…";
     try {
       await post(`/api/papers/${id}/answers`, {answers}, "PUT");
       if (!valid()) return;
-      await openPaper(id); if (valid()) $("#ansMsg").textContent = "已保存；重新批改后使用新答案";
+      await openPaper(id, warnings); if (valid()) $("#ansMsg").textContent = "已保存；重新批改后使用新答案";
     } catch(e) { if (valid()) $("#ansMsg").textContent = "保存失败：" + e.message; }
+    finally {
+      saving = false;
+      if (valid()) $("#saveAns").disabled = $("#cancelAnswers").disabled = false;
+    }
   }
   $("#saveAns").onclick = () => saveAnswers(Object.values(answerInputs()));
-  $$('[data-confirm]', d).forEach((button) => button.onclick = () => {
-    const qid = button.dataset.confirm;
-    return saveAnswers([{...(answerInputs()[qid] || {id:qid}),confirmed:true}]);
-  });
   if (p.questions.length) {
     const use = document.createElement("button"); use.className = "ghost"; use.textContent = "使用这套试卷批改";
     use.onclick = () => {

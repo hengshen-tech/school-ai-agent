@@ -63,14 +63,53 @@ test('selected saved paper and preparation mode survive draft switching',()=>{
   assert.equal(s.run('selectedPaperId'),'paper_saved');
   assert.equal(s.el('#startUpload').textContent,'开始建库');
 });
-test('paper detail offers explicit confirmation and shows conflicting answers',async()=>{
+test('paper detail defaults to usable answers with an explicit edit button',async()=>{
   const s=setup();
   const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'12+8='}],answers:[{id:'1',answer:'20',teacher_answer:'21',review_status:'review',review_reason:'冲突'}]};
   s.context.fetch=async(url)=>({ok:true,json:async()=>url==='/api/papers'?[]:paper});
   await s.run('openPaper("paper_test")');
-  assert.match(s.el('#paperDetail').innerHTML,/待人工确认/);
+  assert.match(s.el('#paperDetail').innerHTML,/默认直接使用/);
   assert.match(s.el('#paperDetail').innerHTML,/21/);
-  assert.match(s.el('#paperDetail').innerHTML,/data-confirm/);
+  assert.match(s.el('#paperDetail').innerHTML,/编辑答案/);
+  assert.match(s.el('#paperDetail').innerHTML,/readonly/);
+  assert.doesNotMatch(s.el('#paperDetail').innerHTML,/data-confirm|待人工确认|使用前需审核/);
+});
+test('library edit can be cancelled without saving and only saves on explicit click',async()=>{
+  const s=setup(), writes=[];
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'1+1='}],answers:[{id:'1',answer:'2',knowledge:'加法'}]};
+  const inputs=[{dataset:{id:'1',f:'answer'},value:'2',readOnly:true},{dataset:{id:'1',f:'knowledge'},value:'加法',readOnly:true}];
+  s.el('#paperDetail').querySelectorAll=()=>inputs;
+  s.context.fetch=async(url,options={})=>{
+    if(options.method==='PUT') { writes.push(JSON.parse(options.body)); return {ok:true,json:async()=>paper}; }
+    return {ok:true,json:async()=>url==='/api/papers'?[]:paper};
+  };
+  await s.run('openPaper("paper_test")');
+  s.el('#editAnswers').onclick();
+  assert.equal(inputs[0].readOnly,false);
+  assert.equal(s.el('#saveAns').hidden,false);
+  inputs[0].value='3'; s.el('#cancelAnswers').onclick();
+  assert.equal(inputs[0].value,'2'); assert.equal(inputs[0].readOnly,true);
+  assert.equal(writes.length,0);
+  s.el('#editAnswers').onclick(); inputs[0].value='4';
+  await s.el('#saveAns').onclick();
+  assert.equal(writes[0].answers[0].answer,'4');
+  assert.match(s.el('#ansMsg').textContent,/已保存/);
+});
+test('library edit keeps changes after a save failure',async()=>{
+  const s=setup();
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'1+1='}],answers:[{id:'1',answer:'2'}]};
+  const input={dataset:{id:'1',f:'answer'},value:'2',readOnly:true};
+  s.el('#paperDetail').querySelectorAll=()=>[input];
+  s.context.fetch=async(url,options={})=>{
+    if(options.method==='PUT') throw new Error('网络错误');
+    return {ok:true,json:async()=>url==='/api/papers'?[]:paper};
+  };
+  await s.run('openPaper("paper_test")');
+  s.el('#editAnswers').onclick(); input.value='3';
+  await s.el('#saveAns').onclick();
+  assert.equal(input.value,'3'); assert.equal(input.readOnly,false);
+  assert.equal(s.el('#saveAns').disabled,false);
+  assert.match(s.el('#ansMsg').textContent,/保存失败/);
 });
 test('running job raw preview uses active job ID before result exists',()=>{
   const s=setup();s.run('cur = null; activeJob = {id:"running-a",page_count:2}; page=1; kind="raw"; drawPage()');
@@ -92,6 +131,14 @@ test('stream output preserves completed status and deduplicates replay IDs',()=>
   s.run('stageState = {}; seenEvents = new Set(); applyJobEvent({id:1,stage:"parse",status:"done",kind:"status",message:"完成"}); applyJobEvent({id:2,stage:"parse",status:"output",kind:"output",text:"abc"}); applyJobEvent({id:2,stage:"parse",status:"output",kind:"output",text:"abc"})');
   assert.equal(s.run('stageState.parse.status'),'done');
   assert.equal(s.run('stageState.parse.outputs.get("").text'),'abc');
+});
+test('thinking activity appears once with ellipsis even through historical replay',()=>{
+  const s=setup();
+  s.run('applyJobEvent({id:1,stage:"process",status:"start",kind:"status",message:"开始"});applyJobEvent({id:2,stage:"process",kind:"activity",message:"模型正在思考"});applyJobEvent({id:3,stage:"process",kind:"activity",message:"模型正在思考...",activity_type:"thinking"});applyJobEvent({id:4,stage:"process",kind:"activity",message:"正在读取原图"});applyJobEvent({id:5,stage:"process",kind:"activity",message:"模型正在思考"})');
+  assert.equal(s.run('stageState.process.logs.filter(x=>x.startsWith("模型正在思考")).length'),1);
+  assert.equal(s.run('stageState.process.logs[1]'),'模型正在思考...');
+  assert.equal(s.run('stageState.process.status'),'start');
+  assert.equal(s.run('stageState.process.logs[2]'),'正在读取原图');
 });
 test('grading route survives reload and safely decodes submission IDs',()=>{
   const s=setup();assert.equal(s.run('gradingRoute("#grading/test-123")'),'test-123');
@@ -196,6 +243,35 @@ test('late retry failure cannot replace another grading job notice',async()=>{
   s.run('stopWatching();activeJob={id:"B"}');s.el('#jobNotice').textContent='B 的提示';
   reject(new Error('A retry failed'));await retrying;
   assert.equal(s.el('#jobNotice').textContent,'B 的提示');
+});
+test('stop button cancels active job once and offers retry',async()=>{
+  const s=setup(), calls=[];let resolve;
+  s.context.fetch=(url)=>{calls.push(url);return url.endsWith('/stop')?new Promise(r=>resolve=r):Promise.resolve({ok:true,json:async()=>[]});};
+  s.run('activeJob={id:"stop-me",status:"running"};stageState={process:{status:"start",started_at:100,logs:["正在读图"]}};es=new EventSource("stream");syncStopButton()');
+  assert.equal(s.el('#stopJob').hidden,false);
+  const stopping=s.el('#stopJob').onclick();await s.el('#stopJob').onclick();
+  assert.equal(s.el('#stopJob').disabled,true);
+  assert.equal(calls.filter(x=>x.endsWith('/stop')).length,1);
+  resolve({ok:true,json:async()=>({id:'stop-me',status:'interrupted',done:true,error:'任务已手动停止，可重试',finished_at:105})});
+  await stopping;
+  assert.equal(s.run('activeJob.status'),'interrupted');
+  assert.equal(s.el('#stopJob').hidden,true);assert.equal(s.el('#retryJob').hidden,false);
+  assert.equal(s.run('stageState.process.status'),'error');assert.equal(s.sources[0].closed,true);
+});
+test('late stop response cannot replace a different active job',async()=>{
+  const s=setup();let resolve;
+  s.context.fetch=url=>url.endsWith('/stop')?new Promise(r=>resolve=r):Promise.resolve({ok:true,json:async()=>[]});
+  s.run('activeJob={id:"A",status:"running"}');const stopping=s.el('#stopJob').onclick();
+  s.run('stopWatching();activeJob={id:"B",status:"running"};syncStopButton()');s.el('#jobNotice').textContent='B 的提示';
+  resolve({ok:true,json:async()=>({id:'A',status:'interrupted',error:'已停止'})});await stopping;
+  assert.equal(s.run('activeJob.id'),'B');assert.equal(s.el('#jobNotice').textContent,'B 的提示');
+  assert.equal(s.el('#stopJob').hidden,false);assert.equal(s.el('#stopJob').disabled,false);
+});
+test('replaying stopped job history does not revive stop button',async()=>{
+  const s=setup();s.context.fetch=async()=>({ok:true,json:async()=>({id:'stopped',filename:'work',status:'interrupted',done:true,error:'任务已手动停止',page_count:0,last_event_id:2})});
+  await s.run('watch("stopped")');
+  await s.sources[0].onmessage({data:JSON.stringify({id:1,stage:'process',status:'start',kind:'status',message:'开始'})});
+  assert.equal(s.run('activeJob.status'),'interrupted');assert.equal(s.el('#stopJob').hidden,true);
 });
 test('late task creation does not reopen tasks or clear newer title input',async()=>{
   const s=taskHarness();s.el('#tClass').value='class';s.el('#tTitle').value='A';
@@ -445,6 +521,19 @@ function reviewFixture(s) {
   s.run(`cur=${JSON.stringify(job)};page=1;kind="raw"`);
   return job;
 }
+test('reference alignment warning remains visible on completed grading results',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.warnings=["老师答案题号 99 未对齐，其他题继续批改"];drawResult()');
+  assert.match(s.el('#jobNotice').textContent,/参考答案提醒.*99.*其他题继续批改/);
+  assert.match(s.el('#qlist').innerHTML,/data-q="1"/);
+});
+test('prepared paper displays escaped reference warnings',async()=>{
+  const s=setup();
+  s.context.fetch=async()=>({ok:true,json:async()=>({id:'paper',title:'Quiz',questions:[],answers:[]})});
+  await s.run('openPaper("paper",["老师答案 <img> 未对齐"])');
+  assert.match(s.el('#paperDetail').innerHTML,/参考答案提醒.*&lt;img&gt;/);
+  assert.doesNotMatch(s.el('#paperDetail').innerHTML,/<img>/);
+});
 test('manual correct switches from another file to the question annotated page',async()=>{
   const s=setup(), job=reviewFixture(s);
   job.questions[0]={...job.questions[0],status:'correct',draw:true,overridden:true};

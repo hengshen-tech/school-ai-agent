@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import threading
 import time
 from pathlib import Path
 from fractions import Fraction
@@ -11,8 +12,11 @@ from fractions import Fraction
 from PIL import Image
 from . import materials, ocr, store
 from .agents import AgentError
+from .config import MODEL_EFFORT
 from .positioning import ANNOTATION_VERSION, pending_positions, apply_visual_fallback
 from .submission_agent import run_single_agent
+from .reference_answers import validate_agent_references
+from .agent_logging import log_event
 
 
 def _clone(value):
@@ -58,6 +62,8 @@ class WorkflowState:
         self.answers, self.ocr_pages = [], {}
         self.positions_submitted = False
         self.score_totals = {}
+        self._commit_lock = threading.Lock()
+        self._cancelled = threading.Event()
         self.paper_cache_hit = False
         self.published = False
         self.reviews_count = 0
@@ -200,8 +206,9 @@ class WorkflowState:
             refs = q.get('source_pages') or ([q['source_page']] if type(q.get('source_page')) is int else [])
             if not q.get('question', '').strip() or q.get('type') not in ('choice', 'blank', 'calc', 'judge', 'subjective'):
                 raise ValueError('每道题必须包含完整题干和有效类型')
-            # Selected papers may supply archived sources using reference indexes.
-            if not refs and not (self.paper and q.get('reference_pages')):
+            # A version-bound library choice supplies canonical question text even
+            # for legacy entries that have no archived source images.
+            if not refs and not (self.paper and (q.get('reference_pages') or data.get('use_selected_paper') is True)):
                 raise ValueError('每道题必须标明题干来源页')
             if any(type(p) is not int or p not in valid_pages for p in refs):
                 raise ValueError('题干来源页无效')
@@ -214,14 +221,25 @@ class WorkflowState:
             if {str(q['id']) for q in saved} != set(ids) or any(
                 store.norm_answer(q['question']) != store.norm_answer(next(x['question'] for x in saved if str(x['id']) == q['id'])) for q in questions):
                 raise ValueError('所选试卷题目必须完整保留，请从试卷库读取完整题目')
-        refs = data.get('reference_answers', [])
+        raw_refs = data.get('original_reference_answers', data.get('reference_answers', []))
+        refs = raw_refs or []
         if refs and not any(m['role'] == 'answer_key' for m in resolved):
             raise ValueError('只有标准答案材料可提供参考答案')
-        if refs:
-            ref_ids = self._ids(refs)
-            if not set(ref_ids) <= set(ids):
-                raise ValueError('老师答案题号未对齐')
-        self.source = {**data, 'materials': resolved, 'questions': questions, 'reference_answers': refs}
+        reported = data.get('agent_unaligned_reference_answers', data.get('unaligned_reference_answers', []))
+        alignment = validate_agent_references(questions, refs, reported)
+        refs = alignment['aligned']
+        if any(m['role'] == 'answer_key' for m in resolved) and not self.teacher_key.strip() and not self.meta.get('prefer_saved_answers'):
+            missing = set(ids) - {r['id'] for r in refs}
+            if missing:
+                alignment['warnings'].append('老师参考答案缺失或题号未对齐：' + '、'.join(q.get('question_label') or q['id'] for q in questions if q['id'] in missing) + '；这些题保留独立解答并转人工确认')
+        self.source = {**data, 'materials': resolved, 'questions': questions, 'reference_answers': refs,
+            'original_reference_answers': _clone(raw_refs), 'agent_unaligned_reference_answers': _clone(reported),
+            'unaligned_reference_answers': alignment['unaligned'],
+            'teacher_reference_issues': alignment['issues'], 'warnings': alignment['warnings']}
+        if alignment['warnings']:
+            log_event('reference_validation', submission_id=self.sid, **alignment)
+        for warning in alignment['warnings']:
+            self.emit(self.current_stage, 'info', warning, kind='activity', warning=True)
         self.source_version += 1
         self.draft_version = 0
         self.answers, self.review, self.grades = [], None, None
@@ -232,7 +250,7 @@ class WorkflowState:
         self.persist(f'source-v{self.source_version}.json', self.source)
         self.published = False
         self.paper_cache_hit = False
-        if not self.paper:
+        if not self.paper and self.meta.get('execution_mode') != 'vision_agent':
             pid, _ = store.match_paper(questions)
             if pid:
                 candidate = store.get_paper(pid)
@@ -243,8 +261,7 @@ class WorkflowState:
         has_teacher_material = any(m['role'] == 'answer_key' for m in resolved)
         same_questions = self.paper and {(str(q['id']), store.norm_answer(q['question'])) for q in self.paper['questions']} == {(q['id'], store.norm_answer(q['question'])) for q in questions}
         trusted = same_questions and cached and {str(a['id']) for a in cached} == set(ids) and all(
-            bool(str(a.get('answer', '')).strip()) and (a.get('review_status') in ('approved', 'manual_confirmed') or a.get('edited') or
-                (a.get('review_status') == 'ai_solved' and a.get('solution_method') == 'single_agent')) for a in cached)
+            bool(str(a.get('answer') or '').strip()) for a in cached)
         if self.paper and (not same_questions or (not self.meta.get('paper_id') and not self._same_source_images(questions))):
             self.paper = None
             self.references = []
@@ -255,21 +272,31 @@ class WorkflowState:
                 if a.get('edited'): a['review_status'] = 'manual_confirmed'
             self.draft_version = 1
             self.review = {'source_version': self.source_version, 'draft_version': 1,
-                           'reviews': [{'id': a['id'], 'status': a['review_status'], 'reason': '复用已复核试卷版本'} for a in self.answers],
+                           'reviews': [{'id': a['id'], 'status': a['review_status'], 'reason': '直接复用试卷库答案'} for a in self.answers],
                            'cached_paper_id': self.paper['id'], 'cached_paper_rev': self.paper.get('rev', 0)}
             self.paper_cache_hit = self.published = True
-            self.emit('paper', 'done', '复用已复核的试卷版本')
+            self.emit('paper', 'done', '直接复用试卷库答案')
             if self.meta.get('execution_mode') not in ('single_agent', 'vision_agent'):
-                self.emit('solve', 'skip', '复用已复核标准答案')
-                self.emit('answer_review', 'skip', '已有当前试卷版本的复核记录')
+                self.emit('solve', 'skip', '复用试卷库标准答案')
+                self.emit('answer_review', 'skip', '库内答案默认直接使用，无需审核')
         return {'source_version': self.source_version, 'draft_version': self.draft_version,
                 'cached_review': self.paper_cache_hit,
                 'next': ('student-grader' if self.mode == 'grade' else 'finish') if self.review else 'submit_draft'}
 
+    def select_library_paper(self, paper, reason):
+        """Bind the Agent's explicit choice; do not infer a match from text or image hashes."""
+        self.paper = paper
+        self.references = paper.get('reference_pages', [])
+        self.meta['paper_id'] = paper['id']
+        self.meta['agent_selected_paper'] = True
+        log_event('paper_selected', submission_id=self.sid, paper_id=paper['id'],
+                  paper_rev=paper.get('rev', 0), reason=reason)
+        self.emit('process', 'info', f"Agent 已匹配试卷库：{paper['title']}，使用库内标准答案", kind='activity')
+
     def submit_single_result(self, data):
         """Validate one agent's final result; these are storage checks, not model stages."""
         source = {key: _clone(data[key]) for key in ('title', 'student_name', 'student_no',
-            'multiple_students', 'questions', 'reference_answers') if key in data}
+            'multiple_students', 'questions', 'reference_answers', 'unaligned_reference_answers', 'paper_match_reason') if key in data}
         source['materials'] = data.get('materials') or [{'page': m['page'],
             'role': m.get('classified_role') or m.get('requested_role', 'auto'),
             'confidence': m.get('classification_confidence', 1.)} for m in self.manifest]
@@ -287,15 +314,17 @@ class WorkflowState:
                 if not teacher_material:
                     answer.pop('teacher_answer', None)
                 teacher = answer.get('teacher_answer')
-                missing = teacher_material and not str(teacher or '').strip()
+                missing = teacher_material and (not str(teacher or '').strip() or answer.get('teacher_reference_missing'))
                 conflict = teacher is not None and not _review_agrees(answer, {
                     'independent_answer': teacher, 'equivalent_to_draft': answer.get('teacher_equivalent') is True})
-                uncertain = answer.get('confident') is not True or not answer['answer'].strip()
+                uncertain = not answer['answer'].strip()
                 uncertain |= answer.get('teacher_reference', {}).get('confident') is False
+                issue = answer.get('teacher_reference_issue', '')
+                uncertain |= bool(issue)
                 answer['review_status'] = 'review' if missing or conflict or uncertain else 'ai_solved'
-                answer['review_reason'] = ('老师答案与独立解题结果冲突' if conflict else
-                    '老师答案缺失或无法辨认' if missing else '独立解题把握不足' if uncertain else '')
-            # This is a source/confidence check of one solution, never a second reviewer.
+                answer['review_reason'] = issue or ('老师答案与独立解题结果冲突' if conflict else
+                    '老师答案缺失或无法辨认' if missing else '标准答案缺失或参考答案不确定' if uncertain else '')
+            # Accept generated keys by default; only missing content or teacher-source issues need attention.
             self.review = {'source_version': self.source_version, 'draft_version': self.draft_version,
                 'method': 'single_agent', 'reviews': [{'id': a['id'], 'status': a['review_status'],
                     'reason': a.get('review_reason', '')} for a in self.answers]}
@@ -338,8 +367,16 @@ class WorkflowState:
             if teacher:
                 a['teacher_answer'] = teacher['answer']
                 a['teacher_reference'] = _clone(teacher)
-            a['teacher_reference_missing'] = bool(has_teacher_material and not self.source.get('reference_answers')
+            elif has_teacher_material and not self.teacher_key.strip() and not self.meta.get('prefer_saved_answers') and a.get('review_status') != 'manual_confirmed':
+                # Do not trust a model's guessed teacher_answer after its explicit
+                # image reference failed alignment.
+                a.pop('teacher_answer', None)
+                a.pop('teacher_reference', None)
+            a['teacher_reference_missing'] = bool(has_teacher_material and not teacher
                 and not self.teacher_key.strip() and not self.meta.get('prefer_saved_answers'))
+            a['teacher_reference_issue'] = self.source.get('teacher_reference_issues', {}).get(a['id'], '')
+            if a['teacher_reference_missing']:
+                a['teacher_reference_issue'] = a['teacher_reference_issue'] or '老师参考答案缺失或题号未对齐'
         self.answers = answers
         self.published = self.paper_cache_hit = False
         self.draft_version += 1
@@ -408,7 +445,7 @@ class WorkflowState:
                 raise ValueError('无效判分')
             reasons = []
             conf = _confidence(r.get('confidence'))
-            if a['review_status'] == 'review': reasons.append('标准答案待复核')
+            if a['review_status'] == 'review': reasons.append(a.get('teacher_reference_issue') or '标准答案待复核')
             if r.get('key_doubt'): reasons.append('批改发现标准答案争议')
             if r['answer_state'] in ('unreadable', 'unaligned'): reasons.append('学生作答无法辨认或对齐')
             if r['answer_state'] == 'answered' and not str(r.get('student_answer', '')).strip(): reasons.append('未确认空白，不能按未作答判错')
@@ -533,8 +570,17 @@ class WorkflowState:
         self.published = True
         self.emit('paper', 'done', '已保存标准答案与试卷来源图')
 
+    def stop_finalization(self):
+        # A renderer may still be running in a thread after async cancellation.
+        # Serialize its commit boundary so a stopped render cannot publish later.
+        with self._commit_lock:
+            self._cancelled.set()
+            return store.get_result(self.sid)
+
     def finalize(self):
         from .pipeline import render_annotations, summarize
+        if self._cancelled.is_set():
+            raise asyncio.CancelledError()
         if not self.source or not self.answers or not self.review:
             raise AgentError('当前版本缺少完整题目或标准答案，无法保存结果')
         if self.mode == 'grade' and (self.grades is None or not self.positions_submitted):
@@ -554,13 +600,22 @@ class WorkflowState:
             'paper_title': paper.get('title', ''), 'paper_rev': paper.get('rev', 0), 'paper_cache_hit': self.paper_cache_hit,
             'paper_similarity': 0, 'answer_source': paper.get('answer_source'), 'model': self.cfg.get('model'),
             'ocr_used': False if self.meta.get('execution_mode') == 'vision_agent' else bool(self.ocr_pages),
-            'ocr_mode': 'vision' if self.meta.get('execution_mode') == 'vision_agent' else 'deepseek_ocr', 'effort': 'high',
+            'ocr_mode': 'vision' if self.meta.get('execution_mode') == 'vision_agent' else 'deepseek_ocr', 'effort': MODEL_EFFORT,
             'vision_fallback_used': any(q.get('position_source') == 'vision_fallback' for q in questions),
             'student_id': student_id, 'student_match': 'manual' if self.meta.get('student_id') else 'auto' if student_id else None,
             'detected_name': who.get('student_name', ''), 'detected_no': who.get('student_no', ''),
             'materials': self.source['materials'], 'graded_pages': [m['page'] for m in self.source['materials'] if m['role'] == 'student_work'],
-            'page_count': len(self.pages), 'questions': questions, 'summary': summarize(questions)}
+            'page_count': len(self.pages), 'questions': questions, 'summary': summarize(questions),
+            'warnings': self.source.get('warnings', []),
+            'unaligned_reference_answers': self.source.get('unaligned_reference_answers', [])}
         if self.mode == 'grade': render_annotations(self.sid, result)
+        with self._commit_lock:
+            if self._cancelled.is_set():
+                raise asyncio.CancelledError()
+            return self._commit_final_result(result, paper)
+
+    def _commit_final_result(self, result, paper):
+        pid = paper['id']
         store.save_result(self.sid, result)
         if self.meta.get('file_key'): store.index_key(self.meta['file_key'], self.sid)
         store.bump_paper(pid)
@@ -585,15 +640,22 @@ async def run_workflow(sid, cfg, meta, emit, teacher_key=''):
     pages, manifest = await asyncio.to_thread(materials.to_pages, inputs, store.sub_dir(sid))
     emit('preprocess', 'done', f'共 {len(pages)} 页', page_count=len(pages))
     state = WorkflowState(sid, cfg, {**meta, 'inputs': inputs}, pages, manifest, emit, teacher_key)
-    state.begin_stage('process', '一个 Agent 正在理解材料、独立解题并对照学生答案',
-                      title='理解题目与独立解题' if state.mode == 'prepare' else '理解、解题与批改')
+    state.begin_stage('process', '一个 Agent 正在识别材料、匹配试卷库并处理作答',
+                      title='理解题目与准备答案' if state.mode == 'prepare' else '匹配试卷与批改')
     data = await run_single_agent(cfg, state)
     state.submit_single_result(data)
-    state.finish_stage('process', '材料理解、独立解题与批改完成' if state.mode == 'grade' else '题目理解与独立解题完成')
+    state.finish_stage('process', ('已复用试卷库答案，批改完成' if state.mode == 'grade' else '已复用试卷库答案')
+                       if state.paper_cache_hit else ('材料理解、解题与批改完成' if state.mode == 'grade' else '题目与答案准备完成'))
     if state.mode == 'grade':
         emit('locate', 'done', f"位置校验完成，{len(pending_positions(state.grades))} 道题保留人工定位")
     emit('annotate', 'start', '保存结果并生成批改图片')
-    result = await asyncio.to_thread(state.finalize)
+    try:
+        result = await asyncio.to_thread(state.finalize)
+    except asyncio.CancelledError:
+        result = state.stop_finalization()
+        if result is None:
+            raise
+        # If the short commit already finished, completion wins a late stop.
     result['elapsed_s'] = round(time.monotonic() - start, 1)
     store.save_result(sid, result)
     emit('annotate', 'done', '工作流完成，已保存试卷与批改结果')

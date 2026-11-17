@@ -9,6 +9,8 @@ import time
 
 from . import store
 from .agents import AgentError
+from .config import MODEL_EFFORT
+from .agent_logging import log_event
 
 ACTIVE = {"queued", "running"}
 
@@ -86,7 +88,7 @@ class JobManager:
             meta.update(execution_mode='vision_agent', ocr_mode='vision', position_method='visual_agent')
         record = {"id": sid, "meta": meta, "teacher_key": teacher_key,
                   "settings": {k: cfg.get(k) for k in ("model", "base_url", "agentic_zoom", "use_ocr")},
-                  "status": "queued", "created_at": now, "stages": {}, "timings": {},
+                  "status": "queued", "created_at": now, "effort": MODEL_EFFORT, "stages": {}, "timings": {},
                   "last_event_id": 0, "page_count": 0, "model_calls": []}
         self.records[sid] = record
         self._save(record)
@@ -109,15 +111,14 @@ class JobManager:
                 if result:
                     record["page_count"] = result.get("page_count", record["page_count"])
                     result.update(timings=record["timings"], queue_s=record["queue_s"],
-                                  model_calls=record["model_calls"], effort="high",
+                                  model_calls=record["model_calls"], effort=record.get('effort', MODEL_EFFORT),
                                   elapsed_s=round(record["finished_at"] - record["started_at"], 1))
                     store.save_result(sid, result)
                 if result:
                     record["paper_id"] = result.get("paper_id")
                 emit("done", "done", "建库完成" if record["meta"].get("mode") == "prepare" else "批改完成")
         except asyncio.CancelledError:
-            record.update(status="interrupted", finished_at=time.time(), error="服务停止，批改已中断，可重试")
-            emit("interrupted", "error", record["error"])
+            self._interrupt(record)
             raise
         except Exception as e:
             message = str(e) if isinstance(e, AgentError) else f"内部错误：{e}"
@@ -128,10 +129,38 @@ class JobManager:
             self._save(record)
             self.changed.setdefault(sid, asyncio.Event()).set()
 
+    def _interrupt(self, record):
+        message = '任务已手动停止，可重试' if record.get('stop_requested') else '服务停止，批改已中断，可重试'
+        record.update(status='interrupted', finished_at=time.time(), error=message)
+        log_event('interrupted', submission_id=record['id'], message=message)
+        for stage, step in list(record.get('stages', {}).items()):
+            if step.get('status') in ('start', 'info') and step.get('started_at') is not None:
+                self.emit(record['id'], stage, 'error', message)
+        self.emit(record['id'], 'interrupted', 'error', message)
+
+    async def stop(self, sid):
+        record = self.record(sid)
+        if not record or record['status'] not in ACTIVE:
+            return self.status(sid)
+        record['stop_requested'] = True
+        log_event('stop_requested', submission_id=sid)
+        self._save(record)
+        task = self.tasks.get(sid)
+        if task and not task.done():
+            # Repeated stop requests must not interrupt SDK cleanup a second time.
+            if not task.cancelling():
+                task.cancel()
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        if record['status'] in ACTIVE:
+            # Cancelling a task before its coroutine starts skips _run's finally.
+            self._interrupt(record)
+        return self.status(sid)
+
     async def close(self):
         tasks = list(self.tasks.values())
         for task in tasks:
-            task.cancel()
+            if not task.cancelling():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def recover(self):
@@ -168,7 +197,7 @@ class JobManager:
             # Results predating durable jobs remain accessible from the queue.
             return {"id": sid, "filename": result["filename"], "status": "done", "done": True,
                     "page_count": result.get("page_count", 0), "created_at": 0, "message": "批改完成",
-                    "model": result.get("model", ""), "effort": "high", "stages": {},
+                    "model": result.get("model", ""), "effort": result.get('effort', 'high'), "stages": {},
                     "timings": result.get("timings", {}), "elapsed_s": result.get("elapsed_s", 0),
                     "ocr_mode": result.get("ocr_mode", "deepseek_ocr" if result.get("ocr_used") else "vision"),
                     "position_method": result.get("position_method"),
@@ -187,7 +216,7 @@ class JobManager:
                 "queue_s": record.get("queue_s", round(now - record.get("created_at", now), 1)),
                 "page_count": record.get("page_count", 0), "ocr_mode": meta.get("ocr_mode", "vision"),
                 "position_method": meta.get("position_method"),
-                "model": record.get("settings", {}).get("model", ""), "effort": "high",
+                "model": record.get("settings", {}).get("model", ""), "effort": record.get('effort', 'high'),
                 "mode": meta.get("mode", "grade"), "workflow_version": meta.get("workflow_version", 1),
                 "execution_mode": meta.get('execution_mode'),
                 "paper_id": record.get("paper_id") or meta.get("paper_id"),

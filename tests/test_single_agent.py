@@ -47,8 +47,8 @@ async def test_single_sdk_query_attaches_images_without_tools_or_mcp(monkeypatch
     assert messages[0]['message']['content'][1]['type'] == 'image'
 
 
-@pytest.mark.parametrize('teacher,confident,expected', [('2', True, 'ai_solved'), ('3', True, 'review'), ('2', False, 'review')])
-def test_single_solution_preserves_teacher_disputes_and_uncertainty(tmp_path, monkeypatch, teacher, confident, expected):
+@pytest.mark.parametrize('teacher,confident,expected', [('2', True, 'ai_solved'), ('3', True, 'review'), ('2', False, 'ai_solved')])
+def test_single_solution_accepts_ai_keys_but_preserves_teacher_disputes(tmp_path, monkeypatch, teacher, confident, expected):
     from test_agent_workflow import state
     s = state(tmp_path, monkeypatch)
     for material in s.manifest:

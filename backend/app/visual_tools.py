@@ -10,6 +10,10 @@ from fractions import Fraction
 from pathlib import Path
 
 from PIL import Image
+if __package__:
+    from .agent_logging import log_event, log_text
+else:  # The scoped crop/calc command executes this file directly.
+    from agent_logging import log_event, log_text
 
 
 class Parser(argparse.ArgumentParser):
@@ -95,7 +99,9 @@ def crop_image(manifest, args):
 
 
 class VisualTools:
-    def __init__(self, pages, references, directory):
+    def __init__(self, pages, references, directory, submission_id=None, library=None):
+        self.library = library
+        self.submission_id = submission_id
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.views = self.directory / 'views'
@@ -108,6 +114,24 @@ class VisualTools:
         self.prefix = [sys.executable, str(Path(__file__).resolve()), '--manifest', str(self.manifest)]
         self.command_prefix = shlex.join(self.prefix)
 
+    def describe_tool(self, name, args):
+        if name == 'Read':
+            path = str(Path(args['file_path']).resolve())
+            if path in self.pages:
+                source = f'上传第 {self.pages.index(path) + 1} 页'
+            elif path in self.references:
+                source = f'参考第 {self.references.index(path) + 1} 页'
+            elif self.library and path in self.library.allowed_files:
+                source = '试卷库资料'
+            else:
+                source = '裁剪细节图'
+            return f'读取{source}：{Path(path).name}'
+        parsed = command_parser().parse_args(shlex.split(args['command'])[2:])
+        if parsed.action == 'calc':
+            return f'核算：{parsed.expression}'
+        source = f'参考第 {parsed.reference} 页' if parsed.reference is not None else f'上传第 {parsed.page} 页'
+        return f'裁剪{source}：区域 {parsed.bbox}（原图 0–1000），放大 {parsed.scale:g} 倍'
+
     async def authorize(self, data, tool_use_id, context):
         specific = {'hookEventName': 'PreToolUse'}
         try:
@@ -116,23 +140,51 @@ class VisualTools:
                 path = Path(args.get('file_path', ''))
                 path = (path if path.is_absolute() else self.directory / path).resolve()
                 if not path.is_file() or (str(path) not in self.allowed_images and not (
-                    path.is_relative_to(self.views) and path.suffix.lower() == '.png')):
-                    raise ValueError('只能读取本任务原图、参考图和裁图片')
+                    path.is_relative_to(self.views) and path.suffix.lower() == '.png') and not (
+                    self.library and str(path) in self.library.allowed_files)):
+                    raise ValueError('只能读取本任务原图、参考图、裁图片和提供的试卷库资料')
                 args['file_path'] = str(path)
             elif name == 'Bash':
                 parts = shlex.split(args.get('command', ''))
                 if parts[:len(self.prefix)] != self.prefix:
                     raise ValueError('仅允许使用输入提供的裁图/算术命令前缀')
                 parsed = command_parser().parse_args(parts[2:])
+                if Path(parsed.manifest).resolve() != self.manifest:
+                    raise ValueError('不能替换本任务的图片清单')
                 if parsed.action == 'calc': calculate(parsed.expression)
                 # Canonical quoting prevents shell expansion, redirects and pipelines.
                 args = {'command': shlex.join(parts), 'timeout': 30000, 'run_in_background': False}
             else:
-                raise ValueError('本任务仅允许 Read 图像和 Bash 裁图/算术')
+                raise ValueError('本任务仅允许 Read 图像/试卷库资料和 Bash 裁图/算术')
             specific.update(permissionDecision='allow', updatedInput=args)
+            log_event('tool_call', submission_id=self.submission_id,
+                tool_use_id=tool_use_id or data.get('tool_use_id'), tool=name, detail=self.describe_tool(name, args))
         except (ValueError, TypeError, OSError, ZeroDivisionError, SyntaxError) as exc:
+            log_event('tool_denied', submission_id=self.submission_id, tool=data.get('tool_name'), reason=str(exc))
             specific.update(permissionDecision='deny', permissionDecisionReason=str(exc))
         return {'hookSpecificOutput': specific}
+
+    async def tool_finished(self, data, tool_use_id, context):
+        ident = tool_use_id or data.get('tool_use_id')
+        if data.get('error'):
+            log_event('tool_failed', submission_id=self.submission_id,
+                tool_use_id=ident, tool=data.get('tool_name'), reason=data['error'])
+        elif data.get('tool_name') == 'Read' and self.library:
+            path = (data.get('tool_input') or {}).get('file_path')
+            response = data.get('tool_response') or {}
+            failed = isinstance(response, dict) and (response.get('is_error') or response.get('isError'))
+            if path and not failed:
+                path = Path(path)
+                self.library.record_read(path if path.is_absolute() else self.directory / path)
+        elif data.get('tool_name') == 'Bash':
+            # Our scoped command only emits crop metadata or arithmetic text.
+            # Never log Read responses, which contain image base64.
+            response = data.get('tool_response') or {}
+            if isinstance(response, dict):
+                for field in ('stdout', 'stderr'):
+                    log_text('tool_result', response.get(field, ''), submission_id=self.submission_id,
+                        tool_use_id=ident, tool='Bash', stream=field)
+        return {}
 
 
 if __name__ == '__main__':

@@ -154,6 +154,14 @@ def submission_status(sid: str):
     return status
 
 
+@app.post('/api/submissions/{sid}/stop')
+async def stop_submission(sid: str):
+    status = await job_manager.stop(sid)
+    if not status:
+        raise HTTPException(404, '批改任务不存在')
+    return status
+
+
 @app.get("/api/submissions/{sid}/events")
 async def events(sid: str, request: Request, after: int = 0):
     submission_status(sid)

@@ -181,6 +181,21 @@ def find_workflow_result(key, *, mode="grade", paper_id="", class_id="", task_id
 
 
 # ---------- 试卷库 ----------
+def library_answers(answers: list[dict]) -> list[dict]:
+    """Library keys are usable by default; keep confidence and source evidence intact."""
+    result = []
+    for item in answers:
+        answer = dict(item)
+        if not str(answer.get("answer") or "").strip():
+            answer["review_status"] = "review"
+        elif answer.get("edited") or answer.get("review_status") == "manual_confirmed":
+            answer["review_status"] = "manual_confirmed"
+        elif answer.get("review_status") != "approved":
+            answer["review_status"] = "ai_solved"
+        result.append(answer)
+    return result
+
+
 def paper_text(questions: list[dict]) -> str:
     return "|".join(norm(q.get("question")) for q in questions)
 
@@ -205,7 +220,10 @@ def get_paper(pid: str):
     meta = _read(d / "paper.json")
     if not meta:
         return None
-    meta["answers"] = _read(d / "answers.json", [])
+    # Also apply the policy to historical entries without rewriting their revision.
+    meta["answers"] = library_answers(_read(d / "answers.json", []))
+    meta["review_summary"] = {status: sum(a.get("review_status") == status for a in meta["answers"])
+                              for status in ("approved", "review", "manual_confirmed", "ai_solved")}
     meta["markdown"] = (d / "paper.md").read_text("utf-8") if (d / "paper.md").exists() else ""
     return meta
 
@@ -265,6 +283,7 @@ def render_markdown(title: str, questions: list[dict], answers: list[dict]) -> s
 
 @_serialized
 def save_paper(title, questions, answers, source: str, pid: str | None = None) -> str:
+    answers = library_answers(answers)
     pid = pid or new_id("paper")
     d = PAPERS_DIR / pid
     qs = [{k: q[k] for k in ("id", "type", "question", "page", "source_page", "source_pages", "reference_page", "reference_pages") if k in q}
@@ -284,7 +303,8 @@ def save_paper(title, questions, answers, source: str, pid: str | None = None) -
 
 @_serialized
 def save_reviewed_paper(title, questions, answers, source, pid=None, reference_pages=None):
-    """Publish reviewed per-question keys and durable source images (including disputes)."""
+    """Publish usable library keys and durable source images, retaining source evidence."""
+    answers = library_answers(answers)
     sources = []
     for number, item in enumerate(reference_pages or [], 1):
         item = dict(item) if isinstance(item, dict) else {"page": number, "path": item}
@@ -329,7 +349,7 @@ def update_answers(pid: str, patch: list[dict]):
             continue
         a = amap.setdefault(qid, {"id": qid, "answer": "", "accepted": [], "explanation": "", "knowledge": ""})
         if "answer" in it and str(it["answer"]).strip() != str(a.get("answer", "")):
-            # 只有真正被老师改过的题才标记为"已人工确认"，其余题保留 AI 的把握度提示
+            # 仅实际修改的题记录人工编辑来源，其余题仍为默认可用的 AI 答案。
             a["answer"] = str(it["answer"]).strip()
             a["confident"] = a["edited"] = bool(a["answer"])
             a["accepted"] = []  # 等价答案属于旧答案，老师修改后不能继续据此判对。

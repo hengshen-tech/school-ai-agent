@@ -38,6 +38,8 @@ async def test_one_vision_agent_owns_roles_grading_and_dynamic_inspection(monkey
     async def agent(cfg, **kwargs):
         calls.append(kwargs)
         assert 'Read' in kwargs['builtin_tools'] and 'Bash' in kwargs['builtin_tools']
+        assert 'Agent' not in kwargs['builtin_tools'] and 'agent_definitions' not in kwargs
+        assert kwargs['submission_id'] == sid
         assert kwargs['max_turns'] > 1 and kwargs['attempts'] == 1
         assert sum(b['type'] == 'image' for b in kwargs['blocks']) == 2
         context = json.loads(kwargs['blocks'][0]['text'])
@@ -45,6 +47,8 @@ async def test_one_vision_agent_owns_roles_grading_and_dynamic_inspection(monkey
         assert 'Multi-scale Image Analysis' in kwargs['system']
         value = final_result(status)
         if status == 'review': value['results'][0]['verdict'] = None
+        assert kwargs['result_filter'](value)
+        assert not kwargs['result_filter']({'path': 'crop.png', 'result': '2'})
         return value
     monkeypatch.setattr(workflow, 'run_json_agent', forbid_ocr, raising=False)
     monkeypatch.setattr(ocr, 'recognize', forbid_ocr)

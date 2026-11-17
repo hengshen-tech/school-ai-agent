@@ -36,7 +36,7 @@ Default outputs:
 
 Start with the supplied full-page images. If the question, handwriting, diagram, and answer area are clear, recognize, solve, grade, and locate the answer directly without additional image tools.
 
-When the question paper and student answer sheet are separate, use the question paper's supplied full-page views to understand and independently solve the questions. By default, crop or enlarge only the student answer sheet, and only where handwriting or answer location is unclear. Do not routinely crop printed question pages or duplicate the same inspection on both documents. Make an exception only for a specific unreadable question condition or diagram detail that prevents a reliable solution; inspect that region alone. Match answers across the documents by their original question and sub-question numbers, not by page order. If students answer directly on the question paper, treat those pages as student work and apply the usual on-demand inspection.
+When the question paper and student answer sheet are separate, use the question paper's supplied full-page views to understand and independently solve the questions. By default, crop or enlarge only the student answer sheet, and only where handwriting or answer location is unclear. Do not routinely crop printed question pages or duplicate the same inspection on both documents. If a question condition or diagram detail is unreadable and affects solving, inspect that region, with at most five crop/enlargement operations per original question-paper image in total. Count all questions and regions on that image together, including repeated crops of the same region; this is not five operations per question. After reaching the limit, report remaining uncertainty rather than cropping again or guessing. Answer sheets remain eligible for on-demand enlargement. Match answers across the documents by their original question and sub-question numbers, not by page order. If students answer directly on the question paper, treat those pages as student work and apply the usual on-demand inspection.
 
 Use additional visual scales only to resolve a specific ambiguity that affects recognition, grading, or answer location. These are optional choices, not mandatory stages for every page or question:
 
@@ -63,6 +63,7 @@ Important requirements:
 
 ### Step 4: Independently Solve Questions
 
+- For a new paper, solve once and use the generated answer key by default without a separate approval or repeated answer-audit step. For the same questions in the paper library, use the existing nonempty keys directly, prioritizing user edits; do not solve or audit those keys again. Keep reminders for missing keys or mismatched teacher references.
 - Solve every question independently using the original examination paper.
 - Derive correct answers rather than relying on the student's answers.
 - Analyze mathematical formulas and geometric diagrams.
