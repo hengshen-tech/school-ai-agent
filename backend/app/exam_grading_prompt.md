@@ -36,6 +36,8 @@ Default outputs:
 
 Start with the supplied full-page images. If the question, handwriting, diagram, and answer area are clear, recognize, solve, grade, and locate the answer directly without additional image tools.
 
+When the question paper and student answer sheet are separate, use the question paper's supplied full-page views to understand and independently solve the questions. By default, crop or enlarge only the student answer sheet, and only where handwriting or answer location is unclear. Do not routinely crop printed question pages or duplicate the same inspection on both documents. Make an exception only for a specific unreadable question condition or diagram detail that prevents a reliable solution; inspect that region alone. Match answers across the documents by their original question and sub-question numbers, not by page order. If students answer directly on the question paper, treat those pages as student work and apply the usual on-demand inspection.
+
 Use additional visual scales only to resolve a specific ambiguity that affects recognition, grading, or answer location. These are optional choices, not mandatory stages for every page or question:
 
 1. **Section view:** Prefer one crop containing related questions, their answers, and any shared diagram. Reuse this view for all relevant sub-questions.
@@ -100,6 +102,7 @@ Marking conventions:
 Annotation requirements:
 
 - Automatically locate the corresponding answer regions.
+- When the question paper and answer sheet are separate, return annotation positions only on the student's answer sheet, using its original uploaded page numbers and coordinates; question-source pages remain separate.
 - Prefer placing marks to the right of the relevant student answers; if there is no room on the right, draw directly over the corresponding answer area.
 - Preserve original text, handwriting, diagrams, and page layout.
 - Keep marks associated with the correct answer area; overlaying that answer is allowed when there is no room on its right.
