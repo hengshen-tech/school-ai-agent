@@ -20,6 +20,97 @@ function setup() {
   vm.runInContext(source,context);
   return {run:(s)=>vm.runInContext(s,context),el,sources,context};
 }
+test('new workflow stages distinguish answer review from OCR location',()=>{
+  const s=setup();
+  const stages=JSON.parse(s.run('JSON.stringify(STEPS.map(x=>x[0]))'));
+  assert.ok(stages.includes('answer_review'));
+  assert.ok(stages.includes('locate'));
+  assert.ok(stages.indexOf('answer_review')<stages.indexOf('grade'));
+  assert.ok(stages.indexOf('ocr')<stages.indexOf('parse'));
+});
+test('hook activity cannot downgrade a completed stage',()=>{
+  const s=setup();
+  s.run('stageState={grade:{status:"done",t:10}};applyJobEvent({id:9,stage:"grade",status:"info",kind:"hook",t:11,message:"main: get_state"})');
+  assert.equal(s.run('stageState.grade.status'),'done');
+});
+test('manual positioning switches to the student page and original image',()=>{
+  const s=setup();
+  s.run('cur={id:"sub_test",page_count:2,questions:[{id:"7",page:2,status:"correct"}]};beginManualPosition("7")');
+  assert.equal(s.run('page'),2);
+  assert.equal(s.run('kind'),'raw');
+  assert.match(s.el('#positionHint').textContent,/7/);
+  assert.equal(s.el('#manualPositionTools').hidden,false);
+  s.run('cancelManualPosition()');
+  assert.equal(s.el('#manualPositionTools').hidden,true);
+});
+test('preparation draft sends mode without student archive fields',async()=>{
+  const s=setup(), uploads=[];
+  s.context.fetch=async(url,opt={})=>{
+    if(opt.method==='POST') { uploads.push(opt.body); throw new Error('keep draft'); }
+    return {ok:true,json:async()=>[]};
+  };
+  s.run('uploadMode="prepare";stageFiles([{name:"paper.png",size:10}],"question_paper")');
+  s.el('#uStudent').value='stale-student';s.el('#uClass').value='stale-class';
+  await s.run('uploadFromHome()');
+  assert.equal(uploads[0].get('mode'),'prepare');
+  assert.equal(uploads[0].get('student_id'),null);
+  assert.equal(uploads[0].get('class_id'),null);
+});
+test('selected saved paper and preparation mode survive draft switching',()=>{
+  const s=setup();
+  s.run('uploadMode="prepare";selectedPaperId="paper_saved";stageFiles([{name:"one.png",size:10}]);saveUploadDraft();uploadMode="grade";selectedPaperId="";restoreUploadDraft(activeDraftId)');
+  assert.equal(s.run('uploadMode'),'prepare');
+  assert.equal(s.run('selectedPaperId'),'paper_saved');
+  assert.equal(s.el('#startUpload').textContent,'开始建库');
+});
+test('paper detail defaults to usable answers with an explicit edit button',async()=>{
+  const s=setup();
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'12+8='}],answers:[{id:'1',answer:'20',teacher_answer:'21',review_status:'review',review_reason:'冲突'}]};
+  s.context.fetch=async(url)=>({ok:true,json:async()=>url==='/api/papers'?[]:paper});
+  await s.run('openPaper("paper_test")');
+  assert.match(s.el('#paperDetail').innerHTML,/默认直接使用/);
+  assert.match(s.el('#paperDetail').innerHTML,/21/);
+  assert.match(s.el('#paperDetail').innerHTML,/编辑答案/);
+  assert.match(s.el('#paperDetail').innerHTML,/readonly/);
+  assert.doesNotMatch(s.el('#paperDetail').innerHTML,/data-confirm|待人工确认|使用前需审核/);
+});
+test('library edit can be cancelled without saving and only saves on explicit click',async()=>{
+  const s=setup(), writes=[];
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'1+1='}],answers:[{id:'1',answer:'2',knowledge:'加法'}]};
+  const inputs=[{dataset:{id:'1',f:'answer'},value:'2',readOnly:true},{dataset:{id:'1',f:'knowledge'},value:'加法',readOnly:true}];
+  s.el('#paperDetail').querySelectorAll=()=>inputs;
+  s.context.fetch=async(url,options={})=>{
+    if(options.method==='PUT') { writes.push(JSON.parse(options.body)); return {ok:true,json:async()=>paper}; }
+    return {ok:true,json:async()=>url==='/api/papers'?[]:paper};
+  };
+  await s.run('openPaper("paper_test")');
+  s.el('#editAnswers').onclick();
+  assert.equal(inputs[0].readOnly,false);
+  assert.equal(s.el('#saveAns').hidden,false);
+  inputs[0].value='3'; s.el('#cancelAnswers').onclick();
+  assert.equal(inputs[0].value,'2'); assert.equal(inputs[0].readOnly,true);
+  assert.equal(writes.length,0);
+  s.el('#editAnswers').onclick(); inputs[0].value='4';
+  await s.el('#saveAns').onclick();
+  assert.equal(writes[0].answers[0].answer,'4');
+  assert.match(s.el('#ansMsg').textContent,/已保存/);
+});
+test('library edit keeps changes after a save failure',async()=>{
+  const s=setup();
+  const paper={id:'paper_test',title:'Quiz',questions:[{id:'1',question:'1+1='}],answers:[{id:'1',answer:'2'}]};
+  const input={dataset:{id:'1',f:'answer'},value:'2',readOnly:true};
+  s.el('#paperDetail').querySelectorAll=()=>[input];
+  s.context.fetch=async(url,options={})=>{
+    if(options.method==='PUT') throw new Error('网络错误');
+    return {ok:true,json:async()=>url==='/api/papers'?[]:paper};
+  };
+  await s.run('openPaper("paper_test")');
+  s.el('#editAnswers').onclick(); input.value='3';
+  await s.el('#saveAns').onclick();
+  assert.equal(input.value,'3'); assert.equal(input.readOnly,false);
+  assert.equal(s.el('#saveAns').disabled,false);
+  assert.match(s.el('#ansMsg').textContent,/保存失败/);
+});
 test('running job raw preview uses active job ID before result exists',()=>{
   const s=setup();s.run('cur = null; activeJob = {id:"running-a",page_count:2}; page=1; kind="raw"; drawPage()');
   assert.match(s.el('#pageImg').src,/running-a\/pages\/1\?kind=raw/);
@@ -40,6 +131,14 @@ test('stream output preserves completed status and deduplicates replay IDs',()=>
   s.run('stageState = {}; seenEvents = new Set(); applyJobEvent({id:1,stage:"parse",status:"done",kind:"status",message:"完成"}); applyJobEvent({id:2,stage:"parse",status:"output",kind:"output",text:"abc"}); applyJobEvent({id:2,stage:"parse",status:"output",kind:"output",text:"abc"})');
   assert.equal(s.run('stageState.parse.status'),'done');
   assert.equal(s.run('stageState.parse.outputs.get("").text'),'abc');
+});
+test('thinking activity appears once with ellipsis even through historical replay',()=>{
+  const s=setup();
+  s.run('applyJobEvent({id:1,stage:"process",status:"start",kind:"status",message:"开始"});applyJobEvent({id:2,stage:"process",kind:"activity",message:"模型正在思考"});applyJobEvent({id:3,stage:"process",kind:"activity",message:"模型正在思考...",activity_type:"thinking"});applyJobEvent({id:4,stage:"process",kind:"activity",message:"正在读取原图"});applyJobEvent({id:5,stage:"process",kind:"activity",message:"模型正在思考"})');
+  assert.equal(s.run('stageState.process.logs.filter(x=>x.startsWith("模型正在思考")).length'),1);
+  assert.equal(s.run('stageState.process.logs[1]'),'模型正在思考...');
+  assert.equal(s.run('stageState.process.status'),'start');
+  assert.equal(s.run('stageState.process.logs[2]'),'正在读取原图');
 });
 test('grading route survives reload and safely decodes submission IDs',()=>{
   const s=setup();assert.equal(s.run('gradingRoute("#grading/test-123")'),'test-123');
@@ -145,6 +244,35 @@ test('late retry failure cannot replace another grading job notice',async()=>{
   reject(new Error('A retry failed'));await retrying;
   assert.equal(s.el('#jobNotice').textContent,'B 的提示');
 });
+test('stop button cancels active job once and offers retry',async()=>{
+  const s=setup(), calls=[];let resolve;
+  s.context.fetch=(url)=>{calls.push(url);return url.endsWith('/stop')?new Promise(r=>resolve=r):Promise.resolve({ok:true,json:async()=>[]});};
+  s.run('activeJob={id:"stop-me",status:"running"};stageState={process:{status:"start",started_at:100,logs:["正在读图"]}};es=new EventSource("stream");syncStopButton()');
+  assert.equal(s.el('#stopJob').hidden,false);
+  const stopping=s.el('#stopJob').onclick();await s.el('#stopJob').onclick();
+  assert.equal(s.el('#stopJob').disabled,true);
+  assert.equal(calls.filter(x=>x.endsWith('/stop')).length,1);
+  resolve({ok:true,json:async()=>({id:'stop-me',status:'interrupted',done:true,error:'任务已手动停止，可重试',finished_at:105})});
+  await stopping;
+  assert.equal(s.run('activeJob.status'),'interrupted');
+  assert.equal(s.el('#stopJob').hidden,true);assert.equal(s.el('#retryJob').hidden,false);
+  assert.equal(s.run('stageState.process.status'),'error');assert.equal(s.sources[0].closed,true);
+});
+test('late stop response cannot replace a different active job',async()=>{
+  const s=setup();let resolve;
+  s.context.fetch=url=>url.endsWith('/stop')?new Promise(r=>resolve=r):Promise.resolve({ok:true,json:async()=>[]});
+  s.run('activeJob={id:"A",status:"running"}');const stopping=s.el('#stopJob').onclick();
+  s.run('stopWatching();activeJob={id:"B",status:"running"};syncStopButton()');s.el('#jobNotice').textContent='B 的提示';
+  resolve({ok:true,json:async()=>({id:'A',status:'interrupted',error:'已停止'})});await stopping;
+  assert.equal(s.run('activeJob.id'),'B');assert.equal(s.el('#jobNotice').textContent,'B 的提示');
+  assert.equal(s.el('#stopJob').hidden,false);assert.equal(s.el('#stopJob').disabled,false);
+});
+test('replaying stopped job history does not revive stop button',async()=>{
+  const s=setup();s.context.fetch=async()=>({ok:true,json:async()=>({id:'stopped',filename:'work',status:'interrupted',done:true,error:'任务已手动停止',page_count:0,last_event_id:2})});
+  await s.run('watch("stopped")');
+  await s.sources[0].onmessage({data:JSON.stringify({id:1,stage:'process',status:'start',kind:'status',message:'开始'})});
+  assert.equal(s.run('activeJob.status'),'interrupted');assert.equal(s.el('#stopJob').hidden,true);
+});
 test('late task creation does not reopen tasks or clear newer title input',async()=>{
   const s=taskHarness();s.el('#tClass').value='class';s.el('#tTitle').value='A';
   const creating=s.el('#taskForm').onsubmit({preventDefault(){}});
@@ -209,7 +337,7 @@ test('start sends every material once with roles and selected student, while ret
   assert.equal(uploads[0].body.get('file'),null);
   assert.equal(uploads[0].body.get('file_roles'),'["question_paper","auto"]');
   assert.equal(uploads[0].body.get('student_id'),'student');assert.equal(uploads[0].body.get('answer_key'),'1. A');
-  assert.equal(uploads[0].body.get('ocr_mode'),'deepseek_ocr');
+  assert.equal(uploads[0].body.get('ocr_mode'),'vision');
   s.run('stageFiles([{name:"next.png",size:5}]);show_("settings")');
   s.el('#answerKey').value='new answer';
   uploads[0].resolve({ok:true,json:async()=>({id:'bundle',cached:false})});await uploading;
@@ -234,11 +362,11 @@ test('materials can be removed and invalid file sets are rejected before uploadi
   s.run('stageFiles(Array.from({length:6},()=>({name:"x.pdf",size:40*1024*1024})))');assert.equal(s.run('stagedFiles.length'),1);
   assert.match(s.el('#uploadErr').textContent,/200/);
 });
-test('OCR defaults to DeepSeek when available and falls back to vision',()=>{
-  const s=setup();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  s.el('#uOcr').value='vision';s.el('#uOcr').onchange({target:s.el('#uOcr')});
-  s.run('syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'vision');
-  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');assert.equal(s.el('#uOcr').value,'vision');
+test('new uploads always use vision without OCR',()=>{
+  const s=setup();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');
+  assert.equal(s.run('homeOcrMode'),'vision');
+  s.run('settingsCache={ocr_available:false};syncOcrSelectors()');
+  assert.equal(s.run('defaultOcrMode()'),'vision');
 });
 test('task file selection moves to staged home with task context and no upload',async()=>{
   const s=taskHarness();await s.run('openTask("A")');
@@ -260,6 +388,17 @@ test('result opens first student page and tabs identify each material source',as
   s.run('activeJob={id:"bundle"};allStudents=[{id:"student"}]');
   await s.run('openResult("bundle",false,undefined,viewGeneration)');
   assert.equal(s.run('page'),3);assert.match(s.el('#pageTabs').innerHTML,/试卷.*paper.pdf/);assert.match(s.el('#pageTabs').innerHTML,/标准答案.*key.pdf/);assert.match(s.el('#pageTabs').innerHTML,/学生作答.*work.png/);
+});
+test('page navigation groups source files while retaining global page targets',()=>{
+  const s=setup();
+  const materials=[...Array.from({length:8},(_,i)=>({page:i+1,input_index:1,filename:'同名卷.pdf',source_page:i+1,role:'question_paper'})),
+    {page:9,input_index:2,filename:'同名卷.pdf',source_page:1,role:'student_work'}];
+  s.context.bundle={page_count:9,materials};
+  const html=s.run('page=9;pageTabs(bundle)');
+  assert.equal((html.match(/class="page-group"/g)||[]).length,2);
+  assert.equal((html.match(/class="page-source-name"/g)||[]).length,2);
+  assert.match(html,/data-p="8"[^>]*>8<\/button>/);
+  assert.match(html,/data-p="9"[^>]*aria-current="page"[^>]*>1<\/button>/);
 });
 test('cached single upload keeps a result link and cache hint on its retained row',async()=>{
   const s=setup();
@@ -301,7 +440,7 @@ test('task material selection keeps the prior draft separate and restores all of
   const s=taskHarness();
   s.run('settingsCache={ocr_available:true};syncOcrSelectors();classes=[{id:"class",name:"班级"}];allTasks=[{id:"A",class_id:"class",title:"A"}];allStudents=[{id:"student-A",class_id:"class",name:"学生A"}];fillUploadPickers();stageFiles([{name:"A.pdf",size:10}],"student_work")');
   s.el('#uClass').value='class';s.run('fillTaskStudent()');s.el('#uTask').value='A';s.el('#uStudent').value='student-A';
-  s.el('#answerKey').value='A标准答案';s.el('#uOcr').value='vision';s.el('#uOcr').onchange({target:s.el('#uOcr')});
+  s.el('#answerKey').value='A标准答案';
   await s.run('openTask("B")');s.el('#tFile').onchange({target:{files:[{name:'B.pdf',size:10}],value:'x'}});
   assert.equal(s.run('stagedFiles.length'),1);assert.equal(s.run('stagedFiles[0].file.name'),'B.pdf');
   assert.equal(s.el('#answerKey').value,'');assert.equal(s.el('#uTask').value,'B');
@@ -310,7 +449,7 @@ test('task material selection keeps the prior draft separate and restores all of
   s.run(`switchUploadDraft(${previous})`);
   assert.equal(s.run('stagedFiles[0].file.name'),'A.pdf');assert.equal(s.run('stagedFiles[0].role'),'student_work');
   assert.equal(s.el('#answerKey').value,'A标准答案');assert.equal(s.el('#uClass').value,'class');
-  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.el('#uOcr').value,'vision');
+  assert.equal(s.el('#uTask').value,'A');assert.equal(s.el('#uStudent').value,'student-A');assert.equal(s.run('homeOcrMode'),'vision');
   await s.run('openTask("B")');s.el('#tFile').onchange({target:{files:[{name:'B-2.png',size:10}],value:'x'}});
   assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.run('stagedFiles[0].file.name'),'B.pdf');assert.equal(s.el('#answerKey').value,'');
 });
@@ -353,13 +492,108 @@ test('task import validates the saved destination draft limit without changing t
   assert.equal(s.run('[...uploadDrafts.values()].find(draft=>draft.task_id==="B").files.length'),20);
 });
 
-test('task OCR selection overrides the saved draft mode when adding more materials',async()=>{
+test('task uploads normalize historical OCR drafts to vision',async()=>{
   const s=taskHarness();s.run('settingsCache={ocr_available:true};syncOcrSelectors()');
   await s.run('openTask("B")');
   s.el('#tFile').onchange({target:{files:[{name:'one.png',size:10}],value:'x'}});
-  assert.equal(s.el('#uOcr').value,'deepseek_ocr');
-  await s.run('openTask("B")');s.el('#tOcr').value='vision';s.el('#tOcr').onchange({target:s.el('#tOcr')});
+  assert.equal(s.run('homeOcrMode'),'vision');
+  await s.run('openTask("B")');
   s.el('#tFile').onchange({target:{files:[{name:'two.png',size:10}],value:'x'}});
-  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.el('#uOcr').value,'vision');
+  assert.equal(s.run('stagedFiles.length'),2);assert.equal(s.run('homeOcrMode'),'vision');
   assert.equal(s.run('uploadDrafts.get(activeDraftId).ocr_mode'),'vision');
+});
+
+test('repeated stage starts do not reset time and later attempts accumulate',()=>{
+  const s=setup();
+  s.run('stageState={};applyJobEvent({id:1,stage:"parse",status:"start",t:100});applyJobEvent({id:2,stage:"parse",status:"start",t:110});applyJobEvent({id:3,stage:"parse",status:"done",t:120})');
+  assert.equal(s.run('stageState.parse.elapsed_s'),20);
+  s.run('applyJobEvent({id:4,stage:"parse",status:"start",t:150});applyJobEvent({id:5,stage:"parse",status:"done",t:155})');
+  assert.equal(s.run('stageState.parse.elapsed_s'),25);
+});
+test('running steps add current processing time to previously completed time',()=>{
+  const s=setup();
+  s.run('stageState={parse:{status:"start",started_at:100,elapsed_s:20}};renderSteps(stageState)');
+  assert.notEqual(s.el('#steps [data-stage="parse"] .stage-time').textContent,'20.0s');
+});
+
+test('single-agent jobs show one reasoning step and hide legacy model stages',()=>{
+  const s=setup();
+  s.run('activeJob={execution_mode:"single_agent",workflow_version:2,mode:"grade"};renderSteps({process:{status:"start",started_at:100}})');
+  assert.equal(s.el('#steps [data-stage="process"]').hidden,false);
+  for(const key of ['parse','solve','answer_review','grade','review']) assert.equal(s.el(`#steps [data-stage="${key}"]`).hidden,true);
+});
+
+function reviewFixture(s) {
+  const questions=[{id:'1',page:3,status:'review',draw:false,bbox_ok:true,bbox_px:[30,40,60,70],student_answer:'2',answer_state:'answered',question:'1+1=',standard_answer:'2',reasons:[]},
+    {id:'2',page:4,status:'review',draw:false,bbox_ok:true,bbox_px:[30,40,60,70],student_answer:'4',answer_state:'answered',question:'2+2=',standard_answer:'4',reasons:[]}];
+  const job={id:'bundle-review',page_count:4,materials:[{page:1,role:'question_paper',filename:'paper.pdf',source_page:1},
+    {page:3,role:'student_work',filename:'work-a.png',source_page:1},{page:4,role:'student_work',filename:'work-b.png',source_page:1}],
+    questions,summary:{correct:0,wrong:0,partial:0,review:2,accuracy:0}};
+  s.run(`cur=${JSON.stringify(job)};page=1;kind="raw"`);
+  return job;
+}
+test('reference alignment warning remains visible on completed grading results',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.warnings=["老师答案题号 99 未对齐，其他题继续批改"];drawResult()');
+  assert.match(s.el('#jobNotice').textContent,/参考答案提醒.*99.*其他题继续批改/);
+  assert.match(s.el('#qlist').innerHTML,/data-q="1"/);
+});
+test('prepared paper displays escaped reference warnings',async()=>{
+  const s=setup();
+  s.context.fetch=async()=>({ok:true,json:async()=>({id:'paper',title:'Quiz',questions:[],answers:[]})});
+  await s.run('openPaper("paper",["老师答案 <img> 未对齐"])');
+  assert.match(s.el('#paperDetail').innerHTML,/参考答案提醒.*&lt;img&gt;/);
+  assert.doesNotMatch(s.el('#paperDetail').innerHTML,/<img>/);
+});
+test('manual correct switches from another file to the question annotated page',async()=>{
+  const s=setup(), job=reviewFixture(s);
+  job.questions[0]={...job.questions[0],status:'correct',draw:true,overridden:true};
+  s.context.fetch=async()=>({ok:true,json:async()=>job});
+  const button={dataset:{q:'1',s:'correct'}};
+  s.context.document.querySelectorAll=selector=>selector==='#qlist button[data-q]'?[button]:[];
+  s.run('drawResult()');await button.onclick();
+  assert.equal(s.run('page'),3);
+  assert.equal(s.run('kind'),'annotated');
+  assert.match(s.el('#pageImg').src,/pages\/3\?kind=annotated/);
+});
+test('manual review on the raw student page opens the annotated view',async()=>{
+  const s=setup(), job=reviewFixture(s);
+  s.run('page=4;kind="raw"');job.questions[1]={...job.questions[1],status:'wrong',draw:true};
+  s.context.fetch=async()=>({ok:true,json:async()=>job});
+  await s.run('applyManualOverride("2","wrong")');
+  assert.equal(s.run('page'),4);assert.equal(s.run('kind'),'annotated');
+});
+test('rapid manual reviews wait for prior updates and retain both decisions',async()=>{
+  const s=setup(), job=reviewFixture(s), calls=[];
+  let release;
+  s.context.fetch=async(url,opt)=>{
+    const data=JSON.parse(opt.body);calls.push(data.qid);
+    if(calls.length===1) await new Promise(resolve=>release=resolve);
+    job.questions=job.questions.map(q=>q.id===data.qid?{...q,status:data.status,draw:true}:q);
+    return {ok:true,json:async()=>structuredClone(job)};
+  };
+  const first=s.run('applyManualOverride("1","correct")');
+  const second=s.run('applyManualOverride("2","wrong")');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(calls,['1']);release();await Promise.all([first,second]);
+  assert.equal(s.run('cur.questions[0].status'),'correct');
+  assert.equal(s.run('cur.questions[1].status'),'wrong');
+  assert.equal(s.run('page'),4);
+});
+test('marked-but-undrawn answers keep positioning with compact page metadata',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.questions[0].status="correct";cur.questions[0].position_note="答案旁没有可用的标注空间";drawResult()');
+  assert.match(s.el('#qlist').innerHTML,/data-position="1"/);
+  assert.match(s.el('#qlist').innerHTML,/<div class="q-verdict"><span>人工改判<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/class="q-position" data-position="1">框选答案位置<\/button>/);
+  assert.match(s.el('#qlist').innerHTML,/<div class="q-meta"><span title="work-a.png 第 1 页">第 3 页<\/span>/);
+});
+
+test('hierarchical question labels display without changing manual review IDs',()=>{
+  const s=setup();reviewFixture(s);
+  s.run('cur.questions[0].question_label="1.1";cur.questions[1].question_label="2.1";drawResult();beginManualPosition("1")');
+  assert.match(s.el('#qlist').innerHTML,/<span class="q-id">1\.1<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/<span class="q-id">2\.1<\/span>/);
+  assert.match(s.el('#qlist').innerHTML,/data-q="1"/);
+  assert.match(s.el('#positionHint').textContent,/第 1\.1 题/);
 });

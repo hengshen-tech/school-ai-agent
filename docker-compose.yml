@@ -14,8 +14,8 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       PAPER_MATCH_THRESHOLD: ${PAPER_MATCH_THRESHOLD:-0.85}
       MAX_PARALLEL_JOBS: ${MAX_PARALLEL_JOBS:-2}     # 同时批改的份数
-      MAX_PARALLEL_MODEL_CALLS: ${MAX_PARALLEL_MODEL_CALLS:-3} # 所有批改共享的模型调用并发上限
-      AGENT_TIMEOUT_S: ${AGENT_TIMEOUT_S:-1800}      # 单次 Agent 调用最多等待 30 分钟
+      MAX_PARALLEL_MODEL_CALLS: ${MAX_PARALLEL_MODEL_CALLS:-3} # 顶层模型会话并发上限
+      AGENT_TIMEOUT_S: ${AGENT_TIMEOUT_S:-1800}      # 主会话及其子 Agent 最多等待 30 分钟
       APP_PASSWORD: ${APP_PASSWORD:-}                # 设置后访问页面需要输入口令（用户名随意）
     restart: unless-stopped
 

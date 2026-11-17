@@ -16,13 +16,14 @@ PAPER_MATCH_THRESHOLD = float(os.environ.get("PAPER_MATCH_THRESHOLD", "0.85"))
 # 发送给模型的整页图片长边上限（像素）
 MODEL_IMAGE_MAX_SIDE = int(os.environ.get("MODEL_IMAGE_MAX_SIDE", "2000"))
 AGENT_TIMEOUT_S = int(os.environ.get("AGENT_TIMEOUT_S", "1800"))
+MODEL_EFFORT = 'low'
 
 DEFAULTS = {
     "model": os.environ.get("LLM_MODEL", "deepseek-flash"),  # DeepSeek V4.1 Flash 的官方模型 ID
     "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/anthropic"),
     "api_key": os.environ.get("LLM_API_KEY", ""),
-    "agentic_zoom": True,  # 允许复核 Agent 自主调用放大工具
-    "use_ocr": True,       # 检测到 DeepSeek 接口时，用它的 OCR 接口做定位参考与交叉核对
+    "agentic_zoom": True,  # 历史视觉复核配置；新批改直接传入原图。
+    "use_ocr": False,      # 只用于兼容旧配置；新任务不使用 OCR。
 }
 
 
@@ -33,12 +34,13 @@ def load_settings() -> dict:
             s.update(json.loads(SETTINGS_FILE.read_text("utf-8")))
         except Exception:
             pass
+    s["use_ocr"] = False
     return s
 
 
 def save_settings(patch: dict) -> dict:
     s = load_settings()
-    for k in ("model", "base_url", "agentic_zoom", "use_ocr"):
+    for k in ("model", "base_url", "agentic_zoom"):
         if k in patch and patch[k] is not None:
             s[k] = patch[k].strip() if isinstance(patch[k], str) else patch[k]
     # Key 留空表示不修改
@@ -61,5 +63,5 @@ def public_settings(s: dict) -> dict:
     from . import ocr
     return {"model": s["model"], "base_url": s["base_url"], "api_key_masked": masked,
             "has_key": bool(key), "agentic_zoom": bool(s.get("agentic_zoom", True)),
-            "use_ocr": bool(s.get("use_ocr", True)), "is_deepseek": bool(ocr.endpoint(s)),
-            "ocr_active": ocr.enabled(s), "ocr_available": ocr.available(s), "effort": "high"}
+            "use_ocr": False, "is_deepseek": bool(ocr.endpoint(s)),
+            "ocr_active": False, "ocr_available": False, "effort": MODEL_EFFORT}

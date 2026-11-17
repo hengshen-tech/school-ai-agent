@@ -12,6 +12,7 @@ from PIL import Image
 
 from . import imaging, materials, ocr, prompts, store
 from .agents import AgentError, run_json_agent
+from .config import MODEL_EFFORT
 
 # 同卷共享正在生成的答案；全局锁只保护查库与登记，不覆盖模型调用。
 _PAPER_STATES = weakref.WeakKeyDictionary()
@@ -659,7 +660,7 @@ async def run_pipeline(sid: str, cfg: dict, meta: dict, emit, teacher_key: str =
               "page_count": len(pages), "paper_id": pid, "paper_title": paper["title"],
               "paper_cache_hit": paper_hit, "paper_similarity": round(ratio, 3),
               "answer_source": paper.get("answer_source"), "model": cfg["model"], "ocr_used": ocr_used,
-              "ocr_mode": meta.get("ocr_mode", "deepseek_ocr" if cfg.get("use_ocr") else "vision"), "effort": "high",
+              "ocr_mode": meta.get("ocr_mode", "deepseek_ocr" if cfg.get("use_ocr") else "vision"), "effort": MODEL_EFFORT,
               "position_method": "ocr_blocks" if ocr_positions else "visual_review",
               "annotation_version": ANNOTATION_VERSION,
               "elapsed_s": round(time.time() - t0, 1), "questions": questions,

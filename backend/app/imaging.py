@@ -1,6 +1,7 @@
 """图片工具：PDF 转图、送模型前压缩、局部裁剪、绘制对错号。全部是确定性代码，不经过模型。"""
 import base64
 import io
+import math
 from pathlib import Path
 
 import pymupdf
@@ -9,7 +10,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from .config import MODEL_IMAGE_MAX_SIDE
 
 RED = (214, 48, 39)
-AMBER = (201, 122, 20)
+YELLOW = (240, 180, 20)
+
+
+def _density(image):
+    value = image.info.get('dpi', (200, 200))
+    if not isinstance(value, (tuple, list)) or len(value) < 2:
+        return (200, 200)
+    return tuple(v if type(v) in (int, float) and math.isfinite(v) and v > 0 else 200 for v in value[:2])
 
 
 def to_pages(src: Path, out_dir: Path) -> list[Path]:
@@ -24,9 +32,11 @@ def to_pages(src: Path, out_dir: Path) -> list[Path]:
             pix.save(p)
             pages.append(p)
     else:
-        img = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+        original = Image.open(src)
+        density = _density(original)
+        img = ImageOps.exif_transpose(original).convert("RGB")
         p = out_dir / "page-1.png"
-        img.save(p)
+        img.save(p, dpi=density)
         pages.append(p)
     return pages
 
@@ -102,25 +112,27 @@ def crop(path: Path, box, pad=0.6, min_side=640, outline=True) -> Image.Image:
 
 def _mark(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, s: int):
     w = max(3, s // 9)
+    def stroke(points, color):
+        draw.line(points, fill='white', width=w + 1, joint='curve')
+        draw.line(points, fill=color, width=w, joint='curve')
     if kind in ("correct", "partial"):
-        draw.line([(x + 0.08 * s, y + 0.55 * s), (x + 0.38 * s, y + 0.86 * s), (x + 0.98 * s, y + 0.08 * s)],
-                  fill=RED, width=w, joint="curve")
+        stroke([(x + 0.08 * s, y + 0.55 * s), (x + 0.38 * s, y + 0.86 * s), (x + 0.98 * s, y + 0.08 * s)], RED)
         if kind == "partial":  # 半对：对号上加一撇
-            draw.line([(x + 0.50 * s, y + 0.30 * s), (x + 0.86 * s, y + 0.60 * s)], fill=RED, width=w)
+            stroke([(x + 0.50 * s, y + 0.30 * s), (x + 0.86 * s, y + 0.60 * s)], RED)
     elif kind == "wrong":
-        draw.line([(x + 0.1 * s, y + 0.1 * s), (x + 0.9 * s, y + 0.9 * s)], fill=RED, width=w)
-        draw.line([(x + 0.9 * s, y + 0.1 * s), (x + 0.1 * s, y + 0.9 * s)], fill=RED, width=w)
+        stroke([(x + 0.1 * s, y + 0.1 * s), (x + 0.9 * s, y + 0.9 * s)], RED)
+        stroke([(x + 0.9 * s, y + 0.1 * s), (x + 0.1 * s, y + 0.9 * s)], RED)
     else:  # review
-        draw.ellipse((x, y, x + s, y + s), outline=AMBER, width=max(2, w // 2))
+        draw.ellipse((x, y, x + s, y + s), outline=YELLOW, width=max(2, w // 2))
         try:
             font = ImageFont.load_default(size=int(s * 0.7))
         except TypeError:
             font = ImageFont.load_default()
-        draw.text((x + s / 2, y + s / 2), "?", fill=AMBER, font=font, anchor="mm")
+        draw.text((x + s / 2, y + s / 2), "?", fill=YELLOW, font=font, anchor="mm")
 
 
 def annotate(page_path: Path, out_path: Path, items: list[dict]):
-    """items: [{status, bbox_px, draw}]；只在位置已确认（draw=True）的题目上落笔。"""
+    """位置确认后优先在答案右侧落笔，右侧无空间则画在答案区域上。"""
     img = Image.open(page_path).convert("RGB")
     draw = ImageDraw.Draw(img)
     short = min(img.size)
@@ -139,26 +151,32 @@ def annotate(page_path: Path, out_path: Path, items: list[dict]):
         s = max(8, round(min(max((y2 - y1) * .8, short * .018), short * .035)))
         cy = min(max(0, (y1 + y2 - s) // 2), img.height - s)
         cx = min(max(0, (x1 + x2 - s) // 2), img.width - s)
-        candidates = [(x2 + gap, cy), (x1 - s - gap, cy), (cx, y1 - s - gap), (cx, y2 + gap)]
-        for x, y in candidates:
-            area = [x, y, x + s, y + s]
-            if x < 0 or y < 0 or x + s > img.width or y + s > img.height:
-                continue
-            if any(intersects(area, other) for other in occupied + marks):
-                continue
-            _mark(draw, it["status"], int(x), int(y), s)
-            marks.append(area)
-            break
-        else:
-            it["draw"] = False
-            it["position_note"] = "答案旁没有可用的标注空间，请人工确认"
+        x, y = x2 + gap, cy
+        area = [x, y, x + s, y + s]
+        if x < 0 or y < 0 or x + s > img.width or y + s > img.height or any(
+            intersects(area, other) for other in occupied + marks
+        ):
+            x, y = cx, cy
+        _mark(draw, it["status"], int(x), int(y), s)
+        marks.append([x, y, x + s, y + s])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path)
+    img.save(out_path, dpi=_density(img))
 
 
 def pages_to_pdf(paths: list[Path]) -> bytes:
-    """把批改后的逐页图片合成一个 PDF。"""
-    imgs = [Image.open(p).convert("RGB") for p in paths]
+    """Losslessly embed page images at their original density and page order."""
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    if not paths:
+        raise ValueError('没有可导出的答卷页')
     buf = io.BytesIO()
-    imgs[0].save(buf, "PDF", save_all=True, append_images=imgs[1:], resolution=200.0)
+    document = canvas.Canvas(buf)
+    for path in paths:
+        with Image.open(path) as original:
+            xdpi, ydpi = _density(original)
+            width, height = original.width * 72 / xdpi, original.height * 72 / ydpi
+            document.setPageSize((width, height))
+            document.drawImage(ImageReader(original.convert('RGB')), 0, 0, width=width, height=height)
+            document.showPage()
+    document.save()
     return buf.getvalue()

@@ -4,6 +4,7 @@
 用来验证「图片确实经由 Agent SDK 送到了模型接口」以及「工具调用往返」。
 """
 import json
+import os
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
@@ -30,6 +31,10 @@ def bbox(i):  # 与 make_sample 的版式对应，0–1000 归一化
 
 def reply_for(body):
     dump = json.dumps(body.get("system", ""), ensure_ascii=False)
+    if "你负责识别上传材料的用途" in dump:
+        return {"text": json.dumps({"role": "student_work", "confidence": .99})}
+    if "你是一位负责整份作业的批改老师" in dump:
+        return single_submission_reply(body)
     msgs = body.get("messages", [])
     imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "image")
     tool_imgs = sum(1 for m in msgs if isinstance(m["content"], list) for b in m["content"]
@@ -126,7 +131,7 @@ async def messages(req: Request):
     msg = {"id": "msg_mock", "type": "message", "role": "assistant", "model": body.get("model"), "content": [],
            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 0}}
     if "tool" in r:
-        block = {"type": "tool_use", "id": "toolu_mock1", "name": r["tool"][0], "input": {}}
+        block = {"type": "tool_use", "id": f"toolu_mock{len(LOG)}", "name": r["tool"][0], "input": {}}
         delta = {"type": "input_json_delta", "partial_json": json.dumps(r["tool"][1])}
         stop = "tool_use"
     else:
@@ -165,6 +170,8 @@ async def ocr(req: Request):
             b = bbox(i)
             text += T(seen, [b[0] + 8, b[1] + 4, b[2] - 60, b[3] - 4])
     LOG.append({"role": "OCR", "purpose": purpose, "bytes": len(await form["file"].read())})
+    if os.environ.get('WORKFLOW_MOCK_SINGLE_QUESTION'):
+        text = T('2', [300, 300, 400, 350])
     if purpose == "text_recognition":
         text = "1. 20\n2. 9\n3. 42\n4. 3/4\n5. 9"
     return {"id": "ocr-mock", "object": "ocr.result", "created": 0, "purpose": purpose, "page_count": 1,
@@ -175,3 +182,40 @@ async def ocr(req: Request):
 @app.get("/log")
 def log():
     return LOG
+
+
+# One-shot submission fixture; every image arrives directly in the user message.
+def single_submission_reply(body):
+    blocks = body['messages'][0]['content']
+    context = json.loads(blocks[0]['text'])
+    selected = context.get('selected_paper')
+    materials = context['materials']
+    work = next((m['page'] for m in materials if m['classified_role'] == 'student_work'), None)
+    source = next((m['page'] for m in materials if m['classified_role'] == 'question_paper'), work or 1)
+    name, student = PROFILES[STATE['n'] % len(PROFILES)]
+    STATE['n'] += 1
+    questions = [{'id': str(i), 'type': 'calc', 'question': q, 'source_pages': [source]}
+        for i, q in enumerate(('12+8=', '15-6=', '7*6=', '1/2+1/4=', '81/9='), 1)]
+    standard = {'1': '20', '2': '9', '3': '42', '4': '.75', '5': '9'}
+    if selected:
+        questions = selected['questions']
+        standard.update({a['id']: a['answer'] for a in selected.get('answers', [])})
+    recognized = {}
+    for block in blocks:
+        text = block.get('text', '')
+        if text.startswith(f'上传第 {work} 页；OCR'):
+            recognized = json.loads(text.split('\n', 1)[1])
+    results = []
+    if context['mode'] == 'grade':
+        for question in questions:
+            ident = question['id']; answer = student.get(ident, '')
+            ids = [b['id'] for b in recognized.get('blocks', []) if b.get('text', '').strip() == answer]
+            results.append({'id': ident, 'page': work, 'student_answer': answer,
+                'answer_state': 'answered' if answer else 'blank',
+                'verdict': 'correct' if store_norm(answer) == store_norm(standard[ident]) else 'wrong',
+                'confidence': .99, 'answer_block_ids': ids})
+    LOG.append({'role': 'single-agent', 'images': sum(b['type'] == 'image' for b in blocks), 'tools': len(body.get('tools', []))})
+    return {'text': json.dumps({'title': '模拟试卷', 'student_name': name, 'questions': [] if selected else questions,
+        'answers': [] if selected else [{'id': q['id'], 'answer': standard[q['id']], 'confident': True,
+                                        'knowledge': KP.get(q['id'], '')} for q in questions],
+        'results': results}, ensure_ascii=False)}
