@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .config import MODEL_IMAGE_MAX_SIDE
 
-RED = (214, 48, 39)
+RED = (214, 48, 39, 153)
 YELLOW = (240, 180, 20)
 
 
@@ -110,18 +110,23 @@ def crop(path: Path, box, pad=0.6, min_side=640, outline=True) -> Image.Image:
     return c
 
 
-def _mark(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, s: int):
+def _mark(kind: str, s: int) -> Image.Image:
     w = max(3, s // 9)
-    def stroke(points, color):
-        draw.line(points, fill='white', width=w + 1, joint='curve')
-        draw.line(points, fill=color, width=w, joint='curve')
+    # Draw intersecting strokes together so they blend with the page only once.
+    mark = Image.new('RGBA', (s + 2 * w, s + 2 * w))
+    draw = ImageDraw.Draw(mark)
+    x = y = w
+
+    def stroke(points):
+        draw.line(points, fill=RED, width=w, joint='curve')
+
     if kind in ("correct", "partial"):
-        stroke([(x + 0.08 * s, y + 0.55 * s), (x + 0.38 * s, y + 0.86 * s), (x + 0.98 * s, y + 0.08 * s)], RED)
+        stroke([(x + 0.08 * s, y + 0.55 * s), (x + 0.38 * s, y + 0.86 * s), (x + 0.98 * s, y + 0.08 * s)])
         if kind == "partial":  # 半对：对号上加一撇
-            stroke([(x + 0.50 * s, y + 0.30 * s), (x + 0.86 * s, y + 0.60 * s)], RED)
+            stroke([(x + 0.50 * s, y + 0.30 * s), (x + 0.86 * s, y + 0.60 * s)])
     elif kind == "wrong":
-        stroke([(x + 0.1 * s, y + 0.1 * s), (x + 0.9 * s, y + 0.9 * s)], RED)
-        stroke([(x + 0.9 * s, y + 0.1 * s), (x + 0.1 * s, y + 0.9 * s)], RED)
+        stroke([(x + 0.1 * s, y + 0.1 * s), (x + 0.9 * s, y + 0.9 * s)])
+        stroke([(x + 0.9 * s, y + 0.1 * s), (x + 0.1 * s, y + 0.9 * s)])
     else:  # review
         draw.ellipse((x, y, x + s, y + s), outline=YELLOW, width=max(2, w // 2))
         try:
@@ -129,19 +134,13 @@ def _mark(draw: ImageDraw.ImageDraw, kind: str, x: int, y: int, s: int):
         except TypeError:
             font = ImageFont.load_default()
         draw.text((x + s / 2, y + s / 2), "?", fill=YELLOW, font=font, anchor="mm")
+    return mark.crop(mark.getbbox())
 
 
 def annotate(page_path: Path, out_path: Path, items: list[dict]):
-    """位置确认后优先在答案右侧落笔，右侧无空间则画在答案区域上。"""
+    """将符号居中叠在答案框上。"""
     img = Image.open(page_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
     short = min(img.size)
-    gap = max(2, round(short * .004))
-    occupied = [it["bbox_px"] for it in items if it.get("bbox_px")]
-    marks = []
-
-    def intersects(a, b):
-        return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
 
     for it in items:
         box = it.get("bbox_px")
@@ -149,16 +148,10 @@ def annotate(page_path: Path, out_path: Path, items: list[dict]):
             continue
         x1, y1, x2, y2 = box
         s = max(8, round(min(max((y2 - y1) * .8, short * .018), short * .035)))
-        cy = min(max(0, (y1 + y2 - s) // 2), img.height - s)
-        cx = min(max(0, (x1 + x2 - s) // 2), img.width - s)
-        x, y = x2 + gap, cy
-        area = [x, y, x + s, y + s]
-        if x < 0 or y < 0 or x + s > img.width or y + s > img.height or any(
-            intersects(area, other) for other in occupied + marks
-        ):
-            x, y = cx, cy
-        _mark(draw, it["status"], int(x), int(y), s)
-        marks.append([x, y, x + s, y + s])
+        mark = _mark(it["status"], s)
+        x = round((x1 + x2 - mark.width) / 2)
+        y = round((y1 + y2 - mark.height) / 2)
+        img.paste(mark, (x, y), mark)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, dpi=_density(img))
 

@@ -8,7 +8,7 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="pipeline-tests-"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 from app import agents, imaging, pipeline, store
 from app.agents import AgentError
 from claude_agent_sdk.types import StreamEvent, AssistantMessage, TextBlock, ResultMessage
@@ -93,18 +93,24 @@ async def test_review_batches_overlap_but_normal_errors_do_not_trigger_tool_fall
     assert all("复核未完成" in q["reasons"] for q in questions)
 
 
-def test_marks_are_close_and_avoid_neighbor_answers(tmp_path):
+@pytest.mark.parametrize("status", ["correct", "partial", "wrong"])
+def test_red_marks_are_centered_and_blend_with_original_ink(tmp_path, status):
     page = tmp_path / "page.png"
-    Image.new("RGB", (1000, 1400), "white").save(page)
-    items = [{"status": "correct", "bbox_px": [100, 100, 180, 135], "draw": True},
-             {"status": "wrong", "bbox_px": [182, 95, 240, 145], "draw": False}]
+    original = Image.new("RGB", (400, 500), "white")
+    ImageDraw.Draw(original).line((65, 70, 135, 70), fill="black", width=5)
+    original.save(page)
+    items = [{"status": status, "bbox_px": [60, 50, 140, 90], "draw": True}]
     imaging.annotate(page, tmp_path / "out.png", items)
-    img = Image.open(tmp_path / "out.png")
-    points = [(x, y) for y in range(80, 155) for x in range(60, 260) if img.getpixel((x, y))[0] > 150 and img.getpixel((x, y))[1] < 100]
-    assert points
-    assert not any(182 <= x <= 240 and 95 <= y <= 145 for x, y in points)
-    # Right candidate collides, so the symbol belongs immediately to the left.
-    assert max(x for x, _ in points) < 100
+    with Image.open(tmp_path / "out.png") as annotated:
+        bounds = ImageChops.difference(original, annotated).getbbox()
+        assert bounds is not None
+        left, top, right, bottom = bounds
+        assert abs((left + right) / 2 - 100) <= 1
+        assert abs((top + bottom) / 2 - 70) <= 1
+        changed = {(original.getpixel((x, y)), annotated.getpixel((x, y)))
+                   for y in range(top, bottom) for x in range(left, right)
+                   if original.getpixel((x, y)) != annotated.getpixel((x, y))}
+    assert changed == {((0, 0, 0), (128, 29, 23)), ((255, 255, 255), (230, 131, 125))}
 
 
 @pytest.mark.asyncio

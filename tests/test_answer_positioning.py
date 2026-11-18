@@ -76,7 +76,7 @@ def test_existing_job_replays_saved_selections_and_keeps_manual_verdict(tmp_path
     assert repaired['questions'][1]['status'] == 'review' and not repaired['questions'][1]['draw']
     assert (d / 'annotated/page-1.png').is_file()
     with Image.open(d / 'annotated/page-1.png') as image:
-        assert any((r > 150 and g < 100 and b < 100) or (g > 100 and r < 100 and b < 100) for r, g, b in image.getdata())
+        assert (230, 131, 125) in image.getdata()
     assert ensure_workflow_annotations(sid, repaired) == repaired
 
 
@@ -130,5 +130,5 @@ def test_manual_override_marks_only_the_student_page_in_multiple_files(tmp_path,
             rendered = client.get(f'/api/submissions/{sid}/pages/{page}?kind=annotated')
             assert rendered.status_code == 200
             with Image.open(io.BytesIO(rendered.content)).convert('RGB') as image:
-                marked = any((r > 150 and g < 100 and b < 100) or (g > 100 and r < 100 and b < 100) for r, g, b in image.getdata())
+                marked = (230, 131, 125) in image.getdata()
                 assert marked is (page == 3)

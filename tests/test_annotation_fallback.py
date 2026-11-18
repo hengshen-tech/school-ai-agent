@@ -122,7 +122,7 @@ def seed_old_result(sid="sub_mark_repair", **changes):
 
 def red_pixels(path):
     with Image.open(path) as image:
-        return sum(1 for pixel in image.convert("RGB").get_flattened_data() if ((pixel[0] > 150 and pixel[1] < 100 and pixel[2] < 100) or (pixel[1] > 100 and pixel[0] < 100 and pixel[2] < 100) or (pixel[0] > 150 and pixel[1] > 100 and pixel[2] < 80)))
+        return image.convert("RGB").get_flattened_data().count((230, 131, 125))
 
 
 def test_open_existing_result_repairs_marks_and_removes_only_old_ocr_reason():

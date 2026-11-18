@@ -9,7 +9,8 @@ from PIL import Image
 
 from . import imaging, ocr, store
 
-ANNOTATION_VERSION = 4
+OCR_REPAIR_VERSION = 4
+ANNOTATION_VERSION = 5
 _REPAIR_LOCK = threading.RLock()
 _WIDTH = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
 _NUMBER = re.compile(r'(?:\d+(?:\.\d+)?|\.\d+)\Z')
@@ -214,8 +215,9 @@ def _saved_proposals(folder):
 
 
 def ensure_workflow_annotations(sid, result):
-    """Replay the Agent's saved selections against existing OCR, preserving manual verdicts."""
-    if result.get('workflow_version') != 2 or result.get('annotation_version', 0) >= ANNOTATION_VERSION:
+    """Redraw saved marks and repair legacy OCR positions when needed."""
+    if (result.get('workflow_version') != 2 or result.get('mode') == 'prepare'
+            or result.get('annotation_version', 0) >= ANNOTATION_VERSION):
         return result
     with _REPAIR_LOCK:
         result = store.get_result(sid) or result
@@ -225,17 +227,18 @@ def ensure_workflow_annotations(sid, result):
         pages = [folder / 'pages' / f'page-{page}.png' for page in range(1, result.get('page_count', 0) + 1)]
         if not pages or not all(p.is_file() for p in pages):
             return result
-        backup = folder / 'result-before-position-repair-v4.json'
-        if not backup.exists():
-            store.save_artifact(sid, backup.name, result)
-        ocr_pages = {int(page): value for page, value in (store._read(folder / 'ocr.json', {}) or {}).items()}
-        questions = result.get('questions', [])
-        for rows in _saved_proposals(folder):
-            try:
-                apply_positions(questions, ocr_pages, pages, rows)
-            except (ValueError, TypeError):
-                continue
-        apply_positions(questions, ocr_pages, pages, [])
+        if result.get('annotation_version', 0) < OCR_REPAIR_VERSION and result.get('execution_mode') != 'vision_agent':
+            backup = folder / 'result-before-position-repair-v4.json'
+            if not backup.exists():
+                store.save_artifact(sid, backup.name, result)
+            ocr_pages = {int(page): value for page, value in (store._read(folder / 'ocr.json', {}) or {}).items()}
+            questions = result.get('questions', [])
+            for rows in _saved_proposals(folder):
+                try:
+                    apply_positions(questions, ocr_pages, pages, rows)
+                except (ValueError, TypeError):
+                    continue
+            apply_positions(questions, ocr_pages, pages, [])
         from .pipeline import render_annotations
         render_annotations(sid, result)
         result['annotation_version'] = ANNOTATION_VERSION

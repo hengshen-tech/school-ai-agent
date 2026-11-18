@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 from app import store
 from app.agents import AgentError
+from app.positioning import ANNOTATION_VERSION
 
 
 def state(tmp_path, monkeypatch, mode='grade'):
@@ -192,7 +193,7 @@ def test_finalize_requires_artifacts_and_returns_compatible_result(tmp_path, mon
     monkeypatch.setattr(pipeline, 'render_annotations', lambda *a: None)
     result = s.finalize()
     assert result['mode'] == mode and result['workflow_version'] == 2
-    assert result['annotation_version'] == 4 and result['position_method'] == 'ocr_blocks'
+    assert result['annotation_version'] == ANNOTATION_VERSION and result['position_method'] == 'ocr_blocks'
     assert len(result['questions']) == (1 if mode == 'grade' else 0)
     assert store.get_result('s')['paper_id'] == s.paper['id']
 

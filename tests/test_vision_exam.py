@@ -60,7 +60,7 @@ async def test_one_vision_agent_owns_roles_grading_and_dynamic_inspection(monkey
     assert result['questions'][0]['draw']
     with Image.open(folder / 'annotated/page-2.png') as image:
         colors = list(image.convert('RGB').getdata())
-    tests = {'red': lambda c: c[0] > 150 and c[1] < 100 and c[2] < 100,
+    tests = {'red': lambda c: c == (230, 131, 125),
              'yellow': lambda c: c[0] > 150 and c[1] > 100 and c[2] < 80}
     assert any(tests[color](c) for c in colors)
 
@@ -77,6 +77,24 @@ def test_upload_accepts_non_deepseek_models_without_ocr(monkeypatch):
         record = manager.record(response.json()['id'])
         assert record['meta']['ocr_mode'] == 'vision'
         assert record['settings']['use_ocr'] is False
+
+
+def test_opening_an_existing_vision_result_refreshes_marks():
+    sid = 'sub_saved_vision'
+    folder = store.sub_dir(sid)
+    (folder / 'pages').mkdir(parents=True)
+    (folder / 'annotated').mkdir()
+    Image.new('RGB', (200, 300), 'white').save(folder / 'pages/page-1.png')
+    Image.new('RGB', (200, 300), 'white').save(folder / 'annotated/page-1.png')
+    question = {'id': '1', 'page': 1, 'status': 'wrong', 'overridden': True,
+                'bbox_px': [50, 50, 150, 100], 'bbox_ok': True, 'draw': True}
+    store.save_result(sid, {'id': sid, 'workflow_version': 2, 'annotation_version': 4,
+        'execution_mode': 'vision_agent', 'page_count': 1, 'questions': [question]})
+
+    result = main.get_submission(sid)
+    assert result['questions'] == [question]
+    with Image.open(folder / 'annotated/page-1.png') as annotated:
+        assert (230, 131, 125) in annotated.crop((93, 68, 107, 82)).getdata()
 
 
 @pytest.mark.asyncio

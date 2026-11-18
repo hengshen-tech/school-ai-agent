@@ -96,17 +96,16 @@ After grading, mark the results directly on the original answer sheet.
 
 Marking conventions:
 
-- Red check mark: Correct answer.
-- Red cross: Incorrect answer.
+- Translucent red check mark: Correct answer.
+- Translucent red cross: Incorrect answer.
 - Yellow question mark: Uncertain answer.
 
 Annotation requirements:
 
-- Automatically locate the corresponding answer regions.
+- During grading, return a tight box around the student's final entry or result line. For multi-line work without a distinct result line, use the last line of the student's active response. Reuse views already inspected for grading.
 - When the question paper and answer sheet are separate, return annotation positions only on the student's answer sheet, using its original uploaded page numbers and coordinates; question-source pages remain separate.
-- Prefer placing marks to the right of the relevant student answers; if there is no room on the right, draw directly over the corresponding answer area.
+- The backend centers each mark over the corresponding answer box.
 - Preserve original text, handwriting, diagrams, and page layout.
-- Keep marks associated with the correct answer area; overlaying that answer is allowed when there is no room on its right.
 - Maintain the original page dimensions and image quality.
 - Map annotation coordinates back to the original image.
 
@@ -115,7 +114,6 @@ Implementation guidance:
 - Use Python Pillow (PIL) for image processing and annotation.
 - Enlarge images when necessary to improve marking precision.
 - Use ImageDraw to draw check marks and crosses.
-- Use white outlines when needed to improve visibility.
 - Resize annotated images to the appropriate original dimensions.
 - Use ReportLab to combine annotated page images into a PDF.
 - Preserve the original page order and generate a complete multi-page PDF when necessary.
